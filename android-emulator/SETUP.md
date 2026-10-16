@@ -16,6 +16,26 @@ hands). ADB needs no window focus, no visible window and no mouse, so the Mac st
 AVD wins because the whole bot depends on ADB. BlueStacks Air is the fallback if the game refuses to run on an AVD.
 x86 / x86_64 images are unusable on Apple Silicon; always pick `arm64-v8a`. On an Intel Mac, pick x86_64 instead.
 
+## Install (Windows, where development happens)
+
+A Windows PC is x86_64, so pick an **x86_64** image with Google Play (the arm64 advice below is for Apple Silicon).
+
+1. Install Android Studio and finish the first-run wizard so the Android SDK gets installed. If it skipped that:
+   Welcome screen > Projects > More Actions (the three dots) > SDK Manager.
+2. Turn on hardware acceleration: Start > "Turn Windows features on or off" > tick **Windows Hypervisor Platform**
+   (and Virtual Machine Platform), then reboot.
+3. Welcome screen > Projects > **More Actions > Virtual Device Manager** > **+ (Create Virtual Device)**.
+   - Hardware: a Pixel row that shows the Play Store icon (a tablet profile suits a landscape game).
+   - System image: Recommended tab, an API level whose row says Google Play, x86_64. Click the download arrow first.
+   - Finish > Advanced settings: RAM 4 GB, Graphics = Hardware.
+4. Press the play button next to the device. Then, in PowerShell:
+   ```powershell
+   $env:Path += ";$env:LOCALAPPDATA\Android\Sdk\platform-tools"
+   adb devices                                  # should list emulator-5554
+   adb exec-out screencap -p > shot.png
+   ```
+5. In the emulator, sign in to Google Play, install **Asphalt 8: Airborne**, and sign in to your Gameloft account.
+
 ## Install (Mac)
 
 1. Install Android Studio (https://developer.android.com/studio), open it once and finish the setup wizard.
