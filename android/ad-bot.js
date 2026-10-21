@@ -374,6 +374,11 @@ const NEVER_TAP = /install|download|learn more|more info|open|get it|play now|sh
 
 // Where to tap to move an ad screen along. Ordered by confidence.
 function adDismissTarget(nodes, ageMs = 0) {
+  // Unity's "Open Store ⏭" pill (a button whose text is "Skip Open Store"). It shows up while the video is still playing
+  // and the owner confirmed the reward is already paid by then, so skipping at once saves up to a minute per ad. It would
+  // otherwise be blocked twice over (NEVER_TAP has "open"), so it needs its own rule; the tap goes on the ⏭ end of the pill.
+  const unitySkip = nodes.find((n) => n.clickable && /^skip\b/i.test((n.text || n.desc).trim()) && /open store/i.test(n.text || n.desc) && n.x2 - n.x1 < 400 && n.y2 > n.y1);
+  if (unitySkip) return { why: 'Unity skip (reward already paid)', x: unitySkip.x2 - Math.round((unitySkip.y2 - unitySkip.y1) * 0.45), y: unitySkip.cy };
   // Networks label the same button differently: resource id (Fyber), content-desc (Meta, "Close Ad"), or visible text
   // (Unity playables, "Close").
   const close = nodes.find((n) => (/close|dismiss/i.test(`${n.id} ${n.desc}`) || /^(close|dismiss)\b/i.test(n.text)) &&

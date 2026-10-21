@@ -99,7 +99,7 @@ detectors; UI-tree reader; ad-source chooser; main loop steps; emulator watchdog
 
 ## Testing
 
-`cd android && node test.js` (43 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
+`cd android && node test.js` (45 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
 the emulator and the tablet, ~20 MB) and the ad-chooser logic in a **dry-run mode** (`AD_BOT_DRY_RUN=1`: no adb calls,
 actions recorded in `dryCalls` / `logLines`). To add a case: `node ad-bot.js --shot samples/<name>.png --serial <id>` on the
 screen, then add an assertion. Always add a negative test when you add a detector (false positives cost real taps).
@@ -215,6 +215,14 @@ left the foreground by itself. The screen was not captured. **Fix: a loop breake
 taps within 2 minutes restarts the game. If that ever fires, save a frame at that moment and find out what screen it is.
 
 Timestamps in the bot's logs are **UTC** (the owner's PC is 5 hours behind).
+
+## Unity "Open Store ⏭" skip (added on the owner's report, not yet seen live)
+
+Unity ads (e.g. Hill Climb Racing 2) show a pill at the top right while the video still plays; its UI-tree text is
+**"Skip Open Store"** (the label says "Open Store" but it skips). The owner watched it: the reward is already paid when it
+shows. The bot used to ignore it (`NEVER_TAP` blocks anything with "open") and waited out the whole video, up to a minute per
+ad. `adDismissTarget` now taps it at once, on the skip glyph at the pill's right end. If a Unity ad ever stops paying, this is
+the first thing to suspect: look for `Unity skip (reward already paid)` in the log and revert that rule.
 
 ## Known weak spot: dead AppLovin playable ads
 

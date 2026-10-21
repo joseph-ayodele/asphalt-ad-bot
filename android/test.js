@@ -88,7 +88,8 @@ const treeCases = {
   'Meta "Close Ad" by content-desc': [[node({ desc: 'Close Ad' })], true],
   'Unity playable "Close" by text': [[node({ cls: 'Button', text: 'Close' })], true],
   'Install Now is never tapped': [[node({ cls: 'Button', text: 'Install Now' })], false],
-  'Skip Open Store is never tapped': [[node({ cls: 'Button', text: 'Skip Open Store' })], false],
+  'Unity "Skip Open Store" pill is tapped at once, on its skip end': [[node({ cls: 'Button', text: 'Skip Open Store', x1: 1217, y1: 34, x2: 1450, y2: 93, cx: 1333, cy: 63 })], true],
+  'a bare "Open Store" (no skip) is never tapped': [[node({ cls: 'Button', text: 'Open Store' })], false],
   'plain video, nothing to tap': [[node({ cls: 'WebView', text: 'Ad Player', clickable: false })], false],
   'AdMob "Skip" is left alone early in an ad': [[node({ cls: 'Button', desc: 'Skip' })], false],
   'AdMob "Skip" is tapped once the ad has been up 80 s': [[node({ cls: 'Button', desc: 'Skip' })], true, 80000],
@@ -219,6 +220,13 @@ Object.assign(cases, {
     bot.st.dismissTaps = []; bot.dryCalls.length = 0;
     const t0 = Date.now();
     for (let i = 0; i < 40; i++) assert(!bot.noteDismissTap(t0 + i * 600000));
+  },
+});
+
+Object.assign(cases, {
+  'unity skip: the tap lands on the skip glyph at the right end of the pill, not on "Open Store"': () => {
+    const t = bot.adDismissTarget([node({ cls: 'Button', text: 'Skip Open Store', x1: 1217, y1: 34, x2: 1450, y2: 93, cx: 1333, cy: 63 })]);
+    assert(t && t.x > 1400 && t.x < 1450 && t.y === 63, JSON.stringify(t));
   },
 });
 
