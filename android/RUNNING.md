@@ -24,10 +24,33 @@ node ad-bot.js --stop                                      # stop it (from any t
 If only one device is connected you can leave out `--serial`. `npm start` is shorthand for
 `node ad-bot.js --mode all --loop` (`npm start -- --serial <id>` to pick a device).
 
+## The order ads are played in
+
+Most wanted first. The default order is:
+
+1. **AD RELAY OFFERS** (second FREE tile on the main menu)
+2. **AD REWARDS** (first FREE tile)
+3. the **wrench** PLAY AD! button
+4. the **coin** PLAY AD! button
+
+The order is applied all the time, not just at the start. After "COME BACK LATER" a tile is checked again every 15
+minutes, and as soon as a better source is available again the bot finishes the ad it is on and goes back to it before
+continuing with the lesser ones. Change the order, or leave sources out, with `--order`:
+
+```
+node ad-bot.js --loop --order relay,rewards,wrench,coin      # the default
+node ad-bot.js --loop --order rewards,coin                   # only these two, in this order
+```
+
+There may be a daily cap on ads that we have not seen; when a source stops offering ads the bot simply moves down the
+list and comes back to it later.
+
+Presets for `--order`, via `--mode`: see "Which ads" below.
+
 ## Running it repeatedly
 
-`--loop` is what makes it repeat. The bot plays every ad that is available (garage buttons, **AD REWARDS**, **AD RELAY
-OFFERS**). When it finds nothing left to click for 5 minutes, it waits and checks again, forever, until you stop it.
+`--loop` is what makes it repeat. The bot plays every ad that is available, best first. When it finds nothing left to
+click for 5 minutes, it waits and checks again, forever, until you stop it.
 
 | flag | effect |
 |---|---|
@@ -35,18 +58,43 @@ OFFERS**). When it finds nothing left to click for 5 minutes, it waits and check
 | `--loop 60` | wait 60 minutes between checks |
 | *(no `--loop`)* | do what is available, then exit |
 | `--max 10` | stop after 10 ads |
+| `--restart-hours 3` | restart the game every 3 hours (default 2 with `--loop`; `0` turns it off) |
 
 In our testing the garage buttons came back within about 3 hours, and the ad tiles show their own timers, so a check
 every 30 to 60 minutes loses little. Each ad takes 30 to 70 seconds and the garage allowed about a dozen per refresh.
 
+## Overnight or indefinitely
+
+```
+node ad-bot.js --loop --serial <id>
+```
+
+is meant to be left running (see "Run it in the background" below for how to detach it). Things it does by itself:
+
+- **Restarts the game every 2 hours**, only between ads, so a leaking or wedged app does not end the run. Change it with
+  `--restart-hours`.
+- **Restarts the emulator if it stops responding.** The emulator's graphics froze once after hours idle (adb answers, but
+  screenshots never come back). After about 5 minutes of errors the bot restarts the emulator (`emulator -avd <name>
+  -no-snapshot-load`), waits for it to boot, and starts the game again. This only applies to emulators. You can run the
+  same recovery by hand with `node ad-bot.js --restart-emulator --serial emulator-5554`.
+- **Recovers from stuck ads**: BACK, then a game restart after 4 minutes, and the ironSource skip button.
+- **Re-checks ad sources** that said "COME BACK LATER" every 15 minutes, and everything after each idle wait.
+
+You still need to keep the computer awake (see below) and, for the emulator, to have created it as described in
+[EMULATOR.md](EMULATOR.md); the watchdog needs Android Studio's `emulator` program, which it finds in the SDK folder (or
+set `ANDROID_SDK_ROOT`).
+
 ## Which ads (`--mode`)
 
-| mode | plays |
+`--mode` is a shortcut for `--order`:
+
+| mode | same as |
 |---|---|
-| `all` (default) | the garage / main-menu PLAY AD! buttons, then AD REWARDS and AD RELAY OFFERS |
-| `garage` | the two PLAY AD! buttons in the top bar only (coin and wrench) |
-| `coin`, `wrench` | just one of those |
-| `relay` | just AD REWARDS and AD RELAY OFFERS |
+| `all` (default) | `--order relay,rewards,wrench,coin` |
+| `rewards` | `--order rewards` |
+| `relay` | `--order relay,rewards` |
+| `garage` | `--order wrench,coin` |
+| `coin`, `wrench` | just that button |
 
 ## Run it in the background
 
@@ -57,7 +105,7 @@ Close-the-window-and-keep-going versions. `--stop` works the same on both system
 ```powershell
 Start-Process node -ArgumentList 'ad-bot.js','--mode','all','--loop','--serial','<id>' -WindowStyle Hidden `
   -RedirectStandardOutput run.out -RedirectStandardError run.err
-Get-Content ad-bot.log -Wait -Tail 20       # watch it (Ctrl+C leaves the bot running)
+Get-Content ad-bot-<id>.log -Wait -Tail 20      # watch it (Ctrl+C leaves the bot running)
 node ad-bot.js --stop
 ```
 
@@ -65,7 +113,7 @@ node ad-bot.js --stop
 
 ```bash
 nohup caffeinate -i node ad-bot.js --mode all --loop --serial <id> > run.out 2>&1 &
-tail -f ad-bot.log                          # watch it (Ctrl+C leaves the bot running)
+tail -f ad-bot-<id>.log                        # watch it (Ctrl+C leaves the bot running)
 node ad-bot.js --stop
 ```
 
@@ -116,10 +164,10 @@ lost).
 | `unauthorized` in `adb devices` | accept "Allow USB debugging?" on the device |
 | `adb not found` | install platform-tools, or set `ADB` to the adb executable |
 | `A bot is already running for ...` | `node ad-bot.js --stop`, then start again |
-| `adb failed ... ETIMEDOUT` repeating (emulator) | the emulator's graphics froze; restart it ([EMULATOR.md](EMULATOR.md)) |
+| `adb failed ... ETIMEDOUT` repeating (emulator) | the emulator's graphics froze. The bot restarts it by itself after a few minutes; to do it now: `node ad-bot.js --restart-emulator --serial emulator-5554` |
 | `empty screencap` repeating (tablet) | the screen is off or locked: wake and unlock it, check the cable |
-| it keeps saying "nothing to click" | no ads left right now, or the game is on a screen it does not know; see `ad-bot.log` |
+| it keeps saying "nothing to click" | no ads left right now, or the game is on a screen it does not know; see `ad-bot-<id>.log` |
 | the game asks which save to keep | see "Sharing one account" above |
 
-Everything the bot does is in `ad-bot.log` (next to `ad-bot.js`). To see what it thinks of the current screen without
+Everything the bot does is in `ad-bot-<id>.log` (next to `ad-bot.js`, one file per device, e.g. `ad-bot-emulator-5554.log`). To see what it thinks of the current screen without
 tapping anything: `node ad-bot.js --probe`. To check the detectors against the saved screenshots: `node test.js`.

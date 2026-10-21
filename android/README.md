@@ -13,9 +13,10 @@ keep using your computer.
 ## What it does
 
 PLAY AD! -> the ad plays -> dismiss the store promo -> the ad's close button -> the game's promo popup X -> NEXT -> next
-ad. It also gets past the title screen, wakes the menu when it hides its buttons, closes Google Play if an ad opens it,
-opens the **AD REWARDS** and **AD RELAY OFFERS** screens from the main menu's FREE tiles, and restarts the game if an ad
-will not close.
+ad. It plays them in a set order (default: **AD RELAY OFFERS**, then **AD REWARDS**, then the wrench and coin buttons;
+see [RUNNING.md](RUNNING.md)). It also gets past the title screen, wakes the menu when it hides its buttons, closes Google
+Play if an ad opens it, opens the AD REWARDS and AD RELAY OFFERS screens from the main menu's FREE tiles, and for long
+runs restarts the game every couple of hours and restarts the emulator if it freezes.
 
 ## How it reads the screen
 

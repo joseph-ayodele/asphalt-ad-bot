@@ -6,6 +6,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { readPng } = require('./png');
+process.env.AD_BOT_DRY_RUN = '1';   // the decision logic runs without a device; adb calls are recorded instead
 const bot = require('./ad-bot');
 
 const near = (got, want, tol = 12) => got && Math.abs(got.x - want[0]) <= tol && Math.abs(got.y - want[1]) <= tol;
@@ -35,6 +36,14 @@ const cases = {
   'ad-admob-reward-granted-x.png': (img) => assert(near(bot.findAdCornerX(img), [1485, 50])),
   'ad-fyber-close-x.png': (img) => assert(near(bot.findAdCornerX(img), [680, 40])),
   'ad-unity-playable-x-top-left.png': (img) => assert(near(bot.findAdCornerX(img), [48, 67])),
+  // ironSource ads: a round skip button (⏭) in the top-right, not in the UI tree; tapping it turns it into a ✕ on the
+  // end card. Unity draws the same button darker than its background.
+  'ad-ironsource-skip-button.png': (img) => {
+    assert(near(bot.findSkipButton(img), [1474, 46], 10), JSON.stringify(bot.findSkipButton(img)));
+    assert(!bot.findAdCornerX(img), 'a skip glyph is not an X');
+  },
+  'ad-ironsource-end-card-x.png': (img) => assert(near(bot.findAdCornerX(img), [1474, 46], 10)),
+  'ad-unity-skip-button.png': (img) => assert(near(bot.findSkipButton(img), [1467, 72], 10)),
 };
 
 Object.assign(cases, {
@@ -83,6 +92,109 @@ const treeCases = {
   'plain video, nothing to tap': [[node({ cls: 'WebView', text: 'Ad Player', clickable: false })], false],
 };
 for (const [name, [nodes, want]] of Object.entries(treeCases)) cases[`tree: ${name}`] = () => assert.strictEqual(!!bot.adDismissTarget(nodes), want);
+
+// ---- which ad is played next ----------------------------------------------------------------------------------------
+// The default order is AD RELAY OFFERS, AD REWARDS, wrench, coin. A better source that is due always beats a worse one that
+// is visible. `run` feeds a real screenshot to the chooser and reports what it did.
+const frame = (name) => readPng(fs.readFileSync(path.join(__dirname, 'samples', name)));
+const FUTURE = Date.now() + 3600000;
+function run(name, { order, mode, done = [], noFill = {}, tileIdx = 0 } = {}) {
+  bot.configure({ order, mode });
+  Object.assign(bot.st, { lastAction: 0, lastPlay: 0, lastHomeTap: 0, lastRelayNav: 0, awaitingAd: false, ads: 0, tileIdx,
+    tileDoneUntil: done.map((d) => (d ? FUTURE : 0)), noFillUntil: { coin: 0, wrench: 0, rewards: 0, relay: 0, ...noFill } });
+  bot.dryCalls.length = 0; bot.logLines.length = 0;
+  const acted = bot.chooseAd(frame(name), Date.now());
+  return { acted, log: bot.logLines.join(' | '), taps: bot.dryCalls.filter((c) => c.includes('input tap')) };
+}
+const tapAt = (r) => (r.taps[0] || '').replace('shell input tap ', '');
+
+Object.assign(cases, {
+  'order: tablet menu, everything due -> opens AD RELAY OFFERS first, not AD REWARDS or the wrench button': () => {
+    const r = run('tablet-main-menu.png');
+    assert(r.acted && /opening relay \(tile 2 of 2\)/.test(r.log), r.log);
+    assert(near({ x: 492, y: 352 }, tapAt(r).split(' ').map(Number), 12), tapAt(r));
+  },
+  'order: AD RELAY OFFERS waiting for its timer -> AD REWARDS next, still ahead of the wrench': () => {
+    const r = run('tablet-main-menu.png', { done: [false, true] });
+    assert(/opening rewards \(tile 1 of 2\)/.test(r.log), r.log);
+    assert(near({ x: 299, y: 350 }, tapAt(r).split(' ').map(Number), 12), tapAt(r));
+  },
+  'order: both tiles waiting -> the wrench button': () => {
+    const r = run('tablet-main-menu.png', { done: [true, true] });
+    assert(/PLAY AD! #1 \(wrench\)/.test(r.log), r.log);
+    assert(near({ x: 1582, y: 216 }, tapAt(r).split(' ').map(Number), 15), tapAt(r));
+  },
+  'order: a custom --order puts the wrench ahead of the tiles': () => {
+    const r = run('tablet-main-menu.png', { order: 'wrench,rewards,relay,coin' });
+    assert(/PLAY AD! #1 \(wrench\)/.test(r.log), r.log);
+  },
+  'order: --order coin never touches the tiles or the wrench': () => {
+    const r = run('tablet-main-menu.png', { order: 'coin' });
+    assert(!r.acted, r.log);
+  },
+  'order: in the garage with a tile due -> go home first, not PLAY AD!': () => {
+    const r = run('garage-play-ad-buttons.png');
+    assert(/going to the main menu for relay/.test(r.log) && !/PLAY AD/.test(r.log), r.log);
+  },
+  'order: in the garage with the tiles waiting -> wrench before coin': () => {
+    const r = run('garage-play-ad-buttons.png', { done: [true, true] });
+    assert(/PLAY AD! #1 \(wrench\)/.test(r.log), r.log);
+  },
+  'order: --order coin,wrench flips it': () => {
+    const r = run('garage-play-ad-buttons.png', { order: 'coin,wrench' });
+    assert(/PLAY AD! #1 \(coin\)/.test(r.log), r.log);
+  },
+  // right after the title screen the PLAY AD! buttons can be visible while the SHOP button is not lit yet: wait for the
+  // menu to settle instead of taking the wrench ahead of AD RELAY OFFERS, but do not wait forever
+  'order: an ambiguous fading-in menu waits, then falls back to the visible button': () => {
+    const img = frame('tablet-main-menu.png');
+    const dim = { w: img.w, h: img.h, data: Buffer.from(img.data) };
+    for (let y = Math.round(img.h * 0.03); y < Math.round(img.h * 0.11); y++)
+      for (let x = Math.round(img.w * 0.78); x < Math.round(img.w * 0.92); x++) dim.data.set([20, 40, 20, 255], (y * img.w + x) * 4);
+    assert(!bot.shopButtonVisible(dim) && !bot.isMainMenu(dim));
+    run('tablet-main-menu.png');                       // resets the state (and performs one action, which we discard)
+    bot.dryCalls.length = 0; bot.logLines.length = 0;
+    const t0 = Date.now();
+    assert(!bot.chooseAd(dim, t0) && bot.dryCalls.length === 0, 'should wait at first');
+    assert(bot.chooseAd(dim, t0 + 9000) && /PLAY AD! #1 \(wrench\)/.test(bot.logLines.join(' ')), `then take the wrench: ${bot.logLines.join(' | ')}`);
+  },
+  'order: --mode garage ignores the tiles': () => {
+    const r = run('tablet-main-menu.png', { mode: 'garage' });
+    assert(/PLAY AD! #1 \(wrench\)/.test(r.log), r.log);
+  },
+  'order: on the AD REWARDS screen -> PLAY AD!': () => {
+    const r = run('tablet-ad-rewards-play-ad.png', { tileIdx: 0 });
+    assert(/PLAY AD! #1 \(rewards\)/.test(r.log), r.log);
+    assert(near({ x: 2188, y: 1504 }, tapAt(r).split(' ').map(Number), 30), tapAt(r));
+  },
+  'order: on the relay screen with no ad ready -> back out and remember it': () => {
+    const r = run('ad-relay-offers-come-back-later.png', { tileIdx: 1 });
+    assert(/relay has no ad ready/.test(r.log) && bot.st.tileDoneUntil[1] > Date.now(), r.log);
+  },
+  'order: --order relay opens the second tile on the emulator menu too': () => {
+    const r = run('main-menu.png', { order: 'relay' });
+    assert(/opening relay \(tile 2 of 2\)/.test(r.log), r.log);
+    assert(near({ x: 186, y: 167 }, tapAt(r).split(' ').map(Number), 10), tapAt(r));
+  },
+});
+
+// ---- overnight: the game is restarted every few hours, but never in the middle of an ad ------------------------------
+Object.assign(cases, {
+  'restart: due after the interval, only between ads': () => {
+    const now = Date.now(), hour = 3600000;
+    bot.args.restartHours = 2;
+    Object.assign(bot.st, { appStartedAt: now - 1.5 * hour, inAd: false, awaitingAd: false });
+    assert(!bot.restartDue(now), 'not yet');
+    bot.st.appStartedAt = now - 2.1 * hour;
+    assert(bot.restartDue(now), 'due');
+    bot.st.inAd = true;
+    assert(!bot.restartDue(now), 'never during an ad');
+    bot.st.inAd = false; bot.st.awaitingAd = true;
+    assert(!bot.restartDue(now), 'never while an ad is loading');
+    bot.st.awaitingAd = false; bot.args.restartHours = 0;
+    assert(!bot.restartDue(now), 'off with --restart-hours 0');
+  },
+});
 
 let failed = 0;
 for (const [file, check] of Object.entries(cases)) {

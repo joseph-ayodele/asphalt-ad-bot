@@ -4,8 +4,10 @@
 // be covered or on another monitor: screenshots come from `screencap`, taps go through `input tap`, and ad screens are
 // read from the UI tree (`uiautomator dump`) where possible.
 //
-//   node ad-bot.js [--mode all|garage|coin|wrench|relay] [--loop [minutes]] [--max N] [--serial <id>]
+//   node ad-bot.js [--order relay,rewards,wrench,coin] [--loop [minutes]] [--restart-hours N] [--max N] [--serial <id>]
+//   node ad-bot.js --mode all|rewards|relay|garage|coin|wrench   (presets for --order)
 //   node ad-bot.js --devices            list connected devices
+//   node ad-bot.js --restart-emulator   restart the emulator and the game (what the watchdog does by itself)
 //   node ad-bot.js --stop [--serial <id>]   stop a bot running in the background (all of them without --serial)
 //   node ad-bot.js --probe              one detection pass on the live screen, no taps
 //   node ad-bot.js --shot out.png       save the current screen
@@ -15,7 +17,7 @@
 // --loop: when no ads are left, wait (default 30 minutes) and check again instead of exiting.
 // Plain Node, no npm packages.
 
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -26,6 +28,9 @@ const TICK_MS = 1000;
 const PLAY_COOLDOWN_MS = 8000;      // the garage stays visible a moment after PLAY AD!
 const AD_OPEN_WAIT_MS = 15000;      // PLAY AD! tapped but no ad screen appeared: no ad filled
 const AD_TIMEOUT_MS = 240000;       // ads run up to ~150s; past this, press BACK
+const AMBIGUOUS_WAIT_MS = 8000;     // how long to wait for the menu to settle before taking a lower-priority ad
+const DEFAULT_RESTART_HOURS = 2;    // with --loop, restart the game this often (--restart-hours 0 turns it off)
+const SKIP_BUTTON_AFTER_MS = 75000; // the corner skip button is only tapped once an ad has been up this long
 const NO_FILL_BACKOFF_MS = 60000;
 const IDLE_STOP_MS = 300000;        // nothing recognisable for this long -> out of ads or on the wrong screen
 const POPUP_SCAN_EVERY_MS = 2000;
@@ -53,7 +58,13 @@ function findAdb() {
 const ADB = process.env.ADB || findAdb();
 let serial = null;
 
+// Tests run the decision logic without a device: nothing is sent, every adb call is recorded in dryCalls.
+const DRY = !!process.env.AD_BOT_DRY_RUN;
+const dryCalls = [];
+const logLines = [];
+
 function adb(args, opts = {}) {
+  if (DRY) { dryCalls.push(args.join(' ')); return Buffer.alloc(0); }
   const full = serial ? ['-s', serial, ...args] : args;
   const r = spawnSync(ADB, full, { maxBuffer: 64 * 1024 * 1024, timeout: opts.timeout || 30000 });
   if (r.error) {
@@ -84,7 +95,7 @@ function pickDevice() {
 }
 
 const sh = (cmd) => adb(['shell', cmd]).toString('utf8');
-const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const sleep = (ms) => { if (!DRY) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
 // Raw framebuffer: 16-byte header (w, h, format, colorspace; 12 bytes on old Android) then RGBA.
 function screencap() {
@@ -112,6 +123,7 @@ const back = () => adb(['shell', 'input', 'keyevent', '4']);
 function launchGame(fresh = false) {
   if (fresh) adb(['shell', 'am', 'force-stop', GAME]);
   adb(['shell', 'monkey', '-p', GAME, '-c', 'android.intent.category.LAUNCHER', '1']);
+  if (fresh) st.appStartedAt = Date.now();
 }
 
 // ---------------------------------------------------------------- pixels
@@ -277,8 +289,8 @@ function popupPanelVisible(img) {
 
 // Close X by shape: two light diagonal strokes brighter than the pixels on the axes around them. Works on popups
 // (any colour) and on ad corners (white on black). Region is pixel bounds.
-function findXShape(img, x0, y0, x1, y1, minDiff = 22, minBright = 40, step = 3, tol = 0) {
-  const hh = Math.max(4, Math.round(Math.min(img.w, img.h) * 0.034) >> 1);
+function findXShape(img, x0, y0, x1, y1, minDiff = 22, minBright = 40, step = 3, tol = 0, half = 0) {
+  const hh = half || Math.max(4, Math.round(Math.min(img.w, img.h) * 0.034) >> 1);
   const diag = [], bg = [[hh, 0], [-hh, 0], [0, hh], [0, -hh], [hh * 5 >> 2, 0], [-hh * 5 >> 2, 0], [0, hh * 5 >> 2], [0, -hh * 5 >> 2]];
   for (const d of [hh >> 2, hh >> 1, 3 * hh >> 2, hh]) diag.push([d, d], [-d, -d], [d, -d], [-d, d]);
   // thin strokes (3 px) need the diagonal samples to tolerate a pixel of misalignment
@@ -303,10 +315,40 @@ function findXShape(img, x0, y0, x1, y1, minDiff = 22, minBright = 40, step = 3,
 // Game promo popups: the X sits in the top-right of a big panel.
 const findPopupX = (img) => findXShape(img, Math.round(img.w * 0.45), 0, img.w, Math.round(img.h * 0.45));
 
-// Ad screens: X in either top corner.
+// Ad screens: X in either top corner. Networks draw it at different sizes (arms of about 12 px or 8 px), so both are tried.
 function findAdCornerX(img) {
   const s = Math.round(Math.min(img.w, img.h) * 0.16);
-  return findXShape(img, img.w - s, 0, img.w, s, 40, 200, 1, 1) || findXShape(img, 0, 0, s, s, 40, 200, 1, 1);
+  const big = Math.max(4, Math.round(Math.min(img.w, img.h) * 0.034) >> 1), small = Math.max(4, Math.round(big * 0.67));
+  for (const half of [big, small]) {
+    const found = findXShape(img, img.w - s, 0, img.w, s, 40, 200, 1, 1, half) || findXShape(img, 0, 0, s, s, 40, 200, 1, 1, half);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Some networks (ironSource, Unity) show a translucent round "skip" button (a flat grey disc with a white ⏭ glyph) in
+// the top-right corner once the video is over; it is not in the UI tree. Tapping it moves on to the end card, where the
+// same button becomes a ✕. A flat disc, brighter than what is behind it, with a bright glyph in the middle.
+function findSkipButton(img) {
+  const m = Math.min(img.w, img.h), r = Math.round(m * 0.032), s = Math.round(m * 0.16);
+  for (let cy = r; cy < s; cy += 2) {
+    for (let cx = img.w - s; cx < img.w - r; cx += 2) {
+      let glyph = 0;
+      for (let dy = -4; dy <= 4; dy += 2) for (let dx = -8; dx <= 8; dx += 2) if (minCh(px(img, cx + dx, cy + dy)) > 225) glyph++;
+      if (glyph < 6) continue;
+      let lo = 255, hi = 0, outLo = 255, outHi = 0;
+      for (let k = 0; k < 12; k++) {
+        const a = (k * Math.PI) / 6, ca = Math.cos(a), sa = Math.sin(a);
+        const v = minCh(px(img, Math.round(cx + 0.75 * r * ca), Math.round(cy + 0.75 * r * sa)));
+        lo = Math.min(lo, v); hi = Math.max(hi, v);
+        const o = minCh(px(img, Math.round(cx + 1.4 * r * ca), Math.round(cy + 1.4 * r * sa)));
+        outLo = Math.min(outLo, o); outHi = Math.max(outHi, o);
+      }
+      // flat disc, either lighter or darker than what is behind it
+      if (hi - lo <= 10 && (lo - outHi >= 15 || outLo - hi >= 15)) return { x: cx, y: cy };
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------- ui tree
@@ -350,6 +392,9 @@ const args = (() => {
     else if (v[i] === '--loop') a.loop = /^\d+(\.\d+)?$/.test(v[i + 1] || '') ? Number(v[++i]) : 30;
     else if (v[i] === '--devices') a.devices = true;
     else if (v[i] === '--stop') a.stop = true;
+    else if (v[i] === '--order') a.order = v[++i];                    // e.g. relay,rewards,wrench,coin
+    else if (v[i] === '--restart-hours') a.restartHours = Number(v[++i]);   // restart the game this often (0 = never)
+    else if (v[i] === '--restart-emulator') a.restartEmulator = true;
     else if (v[i] === '--idle-minutes') a.idleMinutes = Number(v[++i]);   // how long with nothing to click counts as "out of ads"
     else if (v[i] === '--max') a.max = Number(v[++i]);
     else if (v[i] === '--serial') a.serial = v[++i];
@@ -361,18 +406,21 @@ const args = (() => {
   return a;
 })();
 
-const LOG_FILE = path.join(__dirname, 'ad-bot.log');
+// One log per device, so two bots running side by side do not mix their lines: ad-bot-<serial>.log
+const logFile = () => path.join(__dirname, serial ? `ad-bot-${String(serial).replace(/[^\w.-]/g, '_')}.log` : 'ad-bot.log');
 function log(msg) {
+  if (DRY) { logLines.push(msg); return; }
   const line = `${new Date().toISOString().replace('T', ' ').slice(0, 19)} ${msg}`;
   console.log(line);
-  try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (_) { /* a log reader must never stop the bot */ }
+  try { fs.appendFileSync(logFile(), line + '\n'); } catch (_) { /* a log reader must never stop the bot */ }
 }
 
 const st = {
   popupWindowUntil: 0, popupBacks: 0, popupSeen: 0, lastBack: 0, returnedAt: 0, lastTitleTap: 0,
   ads: 0, inAd: false, awaitingAd: false, kind: 'coin', adStart: 0, lastPlay: 0, lastAction: Date.now(), lastPopupScan: 0, backs: 0,
-  noFillUntil: { coin: 0, wrench: 0, relay: 0 }, lastTarget: '', sameTarget: 0, foreign: 0,
+  noFillUntil: { coin: 0, wrench: 0, rewards: 0, relay: 0 }, lastTarget: '', sameTarget: 0, foreign: 0,
   tileDoneUntil: [], tileIdx: 0, lastRelayNav: 0, lastHomeTap: 0, titleSeen: 0, lastWake: 0,
+  appStartedAt: Date.now(), errors: 0, avdName: '', ambiguousSince: 0,
 };
 
 function describe(img) {
@@ -390,18 +438,104 @@ function safeTap(img, x, y, what) {
   return true;
 }
 
-function wantsKind(kind) {
-  return args.mode === 'garage' || args.mode === 'all' || args.mode === kind;
+// ---- which ad to play next -------------------------------------------------------------------------------------------
+// Ad sources, most wanted first by default: AD RELAY OFFERS, AD REWARDS, wrench, coin. The two FREE tiles on the main
+// menu open AD REWARDS and AD RELAY OFFERS (left to right); coin and wrench are the PLAY AD! buttons in the top bar.
+// `--order relay,rewards,wrench,coin` sets the order (and leaves out any source not listed); `--mode` picks a preset.
+const TILE_SOURCES = ['rewards', 'relay'];
+const MODE_SOURCES = {
+  all: ['relay', 'rewards', 'wrench', 'coin'], rewards: ['rewards'], relay: ['relay', 'rewards'],
+  garage: ['wrench', 'coin'], coin: ['coin'], wrench: ['wrench'],
+};
+
+function sourceOrder() {
+  const list = args.order ? args.order.split(',').map((s) => s.trim()).filter(Boolean) : MODE_SOURCES[args.mode];
+  const bad = !list || !list.length || list.find((s) => !MODE_SOURCES.all.includes(s));
+  if (bad) throw new Error(args.order ? `unknown source "${bad}" in --order (use: ${MODE_SOURCES.all.join(', ')})` : `unknown --mode "${args.mode}" (use: ${Object.keys(MODE_SOURCES).join(', ')})`);
+  return list;
 }
 
-const relayEnabled = () => args.mode === 'relay' || args.mode === 'all';
+let ORDER = MODE_SOURCES.all;
+const priority = (src) => ORDER.indexOf(src);       // lower is better, -1 = not wanted
+const tileDue = (idx, now) => priority(TILE_SOURCES[idx]) >= 0 && now > (st.tileDoneUntil[idx] || 0);
+
+function playAd(src, x, y) {
+  if (args.max && st.ads >= args.max) { log(`started ${st.ads} ads, stopping`); process.exit(0); }
+  st.ads++;
+  log(`PLAY AD! #${st.ads} (${src})`);
+  tap(x, y);
+  st.lastPlay = st.lastAction = Date.now();
+  st.kind = src;
+  st.awaitingAd = true;
+}
+
+// Picks and performs the best available action; returns true if it did something. Priority is decided across the whole
+// bot, so a better source that has become available again (its "COME BACK LATER" timer ran out) wins over the one the bot
+// is busy with, between ads.
+function chooseAd(img, now) {
+  if (isRelayScreen(img)) {                               // on AD REWARDS / AD RELAY OFFERS
+    const src = TILE_SOURCES[st.tileIdx];
+    const play = findRelayPlayAd(img);
+    if (play && priority(src) >= 0 && now > st.noFillUntil[src]) { playAd(src, play.cx, play.cy); return true; }
+    if (now - st.lastAction > 4000) {
+      log(`${src} has no ad ready (COME BACK LATER): leaving`);
+      st.tileDoneUntil[st.tileIdx] = now + RELAY_RECHECK_MS;
+      const b = backArrow(img);
+      safeTap(img, b.x, b.y, 'back arrow');
+      sleep(2500);
+      return true;
+    }
+    return false;
+  }
+
+  let best = null;                                        // { pri, run, button }
+  const consider = (pri, run, button = false) => { if (pri >= 0 && (!best || pri < best.pri)) best = { pri, run, button }; };
+
+  for (const p of findGaragePlayAds(img)) {
+    if (now > st.noFillUntil[p.kind]) consider(priority(p.kind), () => playAd(p.kind, p.x, p.y), true);
+  }
+  if (isMainMenu(img)) {
+    const tiles = findFreeTiles(img);
+    TILE_SOURCES.forEach((src, idx) => {
+      if (!tileDue(idx, now)) return;
+      if (idx >= tiles.length) { st.tileDoneUntil[idx] = now + RELAY_RECHECK_MS; return; }   // no such tile (no ad ready)
+      if (now - st.lastRelayNav < 20000) return;
+      consider(priority(src), () => {
+        st.lastRelayNav = now;
+        st.tileIdx = idx;
+        safeTap(img, tiles[idx].x, tiles[idx].y, `opening ${src} (tile ${idx + 1} of ${tiles.length})`);
+        sleep(3000);
+      });
+    });
+  } else if (shopButtonVisible(img) && now - st.lastAction > 3000 && now - st.lastHomeTap > 30000) {
+    // In the garage or another submenu: if a better source is due, the home icon leads to the main menu, where its tile is.
+    TILE_SOURCES.forEach((src, idx) => {
+      if (tileDue(idx, now)) consider(priority(src), () => {
+        st.lastHomeTap = now;
+        safeTap(img, Math.round(img.w * 0.94), Math.round(img.h * 0.072), `going to the main menu for ${src}`);
+        sleep(3000);
+      });
+    });
+  }
+  if (!best) return false;
+  // The menu fades in: the PLAY AD! buttons can show before the SHOP button does. If a better source is due but this frame
+  // cannot say where we are (neither the main menu nor a lit submenu), wait a few seconds rather than take the lesser one.
+  const betterTileDue = TILE_SOURCES.some((src, idx) => tileDue(idx, now) && priority(src) < best.pri);
+  if (best.button && betterTileDue && !isMainMenu(img) && !shopButtonVisible(img)) {
+    if (!st.ambiguousSince) st.ambiguousSince = now;
+    if (now - st.ambiguousSince < AMBIGUOUS_WAIT_MS) return false;
+  }
+  st.ambiguousSince = 0;
+  best.run();
+  return true;
+}
 
 // Out of ads: stop, or with --loop wait and look again (the garage buttons and ad tiles come back over time).
 function idleStop(why) {
   if (!args.loop) { log(`${why} Stopping.`); process.exit(0); }
   log(`${why} Checking again in ${args.loop} min.`);
   sleep(args.loop * 60000);
-  Object.assign(st, { lastAction: Date.now(), lastHomeTap: 0, lastRelayNav: 0, tileDoneUntil: [], noFillUntil: { coin: 0, wrench: 0, relay: 0 } });
+  Object.assign(st, { lastAction: Date.now(), lastHomeTap: 0, lastRelayNav: 0, tileDoneUntil: [], noFillUntil: { coin: 0, wrench: 0, rewards: 0, relay: 0 } });
   log('checking for ads again');
 }
 
@@ -430,61 +564,7 @@ function gameStep() {
   const next = findNext(img);
   if (next) { safeTap(img, next.cx, next.cy, 'NEXT/OK'); sleep(1500); return; }
 
-  const garageBtn = args.mode !== 'relay' && now - st.lastPlay > PLAY_COOLDOWN_MS
-    ? findGaragePlayAds(img).find((p) => wantsKind(p.kind) && now > st.noFillUntil[p.kind]) : null;
-
-  if (relayEnabled() && !garageBtn && now - st.lastPlay > PLAY_COOLDOWN_MS) {
-    if (isRelayScreen(img)) {
-      const play = findRelayPlayAd(img);
-      if (play && now > st.noFillUntil.relay) {
-        if (args.max && st.ads >= args.max) { log(`started ${st.ads} ads, stopping`); process.exit(0); }
-        st.ads++;
-        log(`PLAY AD! #${st.ads} (relay)`);
-        tap(play.cx, play.cy);
-        st.lastPlay = st.lastAction = Date.now();
-        st.kind = 'relay';
-        st.awaitingAd = true;
-        return;
-      }
-      if (!play && now - st.lastAction > 4000) {
-        log(`ad screen ${st.tileIdx + 1} has no ad ready (COME BACK LATER): leaving`);
-        st.tileDoneUntil[st.tileIdx] = now + RELAY_RECHECK_MS;
-        const b = backArrow(img);
-        safeTap(img, b.x, b.y, 'back arrow');
-        sleep(2500);
-        return;
-      }
-    } else if (isMainMenu(img) && now - st.lastRelayNav > 20000) {
-      // open the next ad tile that has not just reported "COME BACK LATER"
-      const tiles = findFreeTiles(img);
-      const idx = tiles.findIndex((_, i) => now > (st.tileDoneUntil[i] || 0));
-      if (idx >= 0) {
-        st.lastRelayNav = now;
-        st.tileIdx = idx;
-        safeTap(img, tiles[idx].x, tiles[idx].y, `opening ad tile ${idx + 1} of ${tiles.length}`);
-        sleep(3000);
-        return;
-      }
-      if (args.mode === 'relay') { idleStop('no ad tile has an ad ready.'); return; }
-    } else if (shopButtonVisible(img) && now - st.lastAction > 15000 && now - st.lastHomeTap > 30000 && [0, 1].some((i) => now > (st.tileDoneUntil[i] || 0))) {
-      // Parked in the garage (or another submenu) with nothing to play: the home icon leads to the main menu.
-      st.lastHomeTap = now;
-      safeTap(img, Math.round(img.w * 0.94), Math.round(img.h * 0.072), 'going to the main menu');
-      sleep(3000);
-      return;
-    }
-  }
-
-  if (garageBtn) {
-    if (args.max && st.ads >= args.max) { log(`started ${st.ads} ads, stopping`); process.exit(0); }
-    st.ads++;
-    log(`PLAY AD! #${st.ads} (${garageBtn.kind})`);
-    tap(garageBtn.x, garageBtn.y);
-    st.lastPlay = st.lastAction = Date.now();
-    st.kind = garageBtn.kind;
-    st.awaitingAd = true;
-    return;
-  }
+  if (now - st.lastPlay > PLAY_COOLDOWN_MS && chooseAd(img, now)) return;
 
   if (now - st.lastAction > QUIET_BEFORE_POPUP_SCAN_MS && now - st.lastPopupScan > POPUP_SCAN_EVERY_MS) {
     st.lastPopupScan = now;
@@ -542,6 +622,12 @@ function adStep(f) {
     img = screencap();
     const c = findAdCornerX(img);
     if (c) target = { why: 'X in ad corner', x: c.x, y: c.y };
+    // The round skip button also shows up in some ads while the video is still playing; wait long enough that a normal
+    // ad is over, so tapping it cannot cost the reward.
+    else if (now - st.adStart > SKIP_BUTTON_AFTER_MS) {
+      const k = findSkipButton(img);
+      if (k) target = { why: 'skip button in ad corner', x: k.x, y: k.y };
+    }
   }
   if (!target) return;
 
@@ -571,11 +657,23 @@ function foreignStep(f) {
   sleep(1500);
 }
 
+// Overnight runs: restart the game every few hours (between ads) so a leaking or wedged app never ends the run.
+function restartDue(now) {
+  return args.restartHours > 0 && now - st.appStartedAt > args.restartHours * 3600000 && !st.inAd && !st.awaitingAd;
+}
+
 function tick() {
   const f = focus();
   if (!f) { sleep(1000); return; }
   if (f.pkg !== GAME) return foreignStep(f);
   st.foreign = 0;
+  if (/MainActivity$/.test(f.act) && restartDue(Date.now())) {
+    log(`restarting the game (it has been running ${args.restartHours} h)`);
+    launchGame(true);
+    sleep(25000);
+    st.lastAction = Date.now();
+    return;
+  }
   if (/MainActivity$/.test(f.act)) {
     if (st.awaitingAd) {
       if (Date.now() - st.lastPlay < AD_OPEN_WAIT_MS) return;   // the ad is still loading
@@ -586,6 +684,47 @@ function tick() {
     return gameStep();
   }
   return adStep(f);
+}
+
+// ---- emulator watchdog -----------------------------------------------------------------------------------------------
+// The emulator's graphics once froze after hours idle (adb answers but screencap never returns). If the bot cannot read
+// the screen for several ticks in a row it restarts the emulator, then the game.
+const EMULATOR_ERRORS_BEFORE_RESTART = 8;
+
+function emulatorExe() {
+  const exe = process.platform === 'win32' ? 'emulator.exe' : 'emulator';
+  const roots = [process.env.ANDROID_SDK_ROOT, process.env.ANDROID_HOME, path.join(os.homedir(), 'Library', 'Android', 'sdk'),
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Android', 'Sdk')].filter(Boolean);
+  for (const r of roots) { const p = path.join(r, 'emulator', exe); if (fs.existsSync(p)) return p; }
+  return null;
+}
+
+function rememberAvdName() {
+  if (!serial || !serial.startsWith('emulator-')) return;
+  try { st.avdName = adb(['emu', 'avd', 'name'], { timeout: 10000 }).toString().split(/\r?\n/)[0].trim(); } catch (_) { /* keep any earlier name */ }
+}
+
+function restartEmulator() {
+  const exe = emulatorExe();
+  if (!st.avdName || !exe) { log('cannot restart the emulator: unknown AVD name or emulator program (set ANDROID_SDK_ROOT)'); return false; }
+  log(`restarting the emulator (AVD ${st.avdName})`);
+  try { adb(['emu', 'kill'], { timeout: 15000 }); } catch (_) { /* it may be too wedged to answer */ }
+  sleep(15000);
+  if (listDevices().some((d) => d.id === serial)) {   // still there: kill the process
+    if (process.platform === 'win32') spawnSync('taskkill', ['/F', '/IM', 'qemu-system-x86_64.exe']);
+    else spawnSync('pkill', ['-f', `qemu-system.*-avd ${st.avdName}`]);
+    sleep(8000);
+  }
+  spawn(exe, ['-avd', st.avdName, '-no-snapshot-load'], { detached: true, stdio: 'ignore' }).unref();
+  for (const end = Date.now() + 5 * 60000; Date.now() < end;) {
+    sleep(6000);
+    try { if (adb(['shell', 'getprop', 'sys.boot_completed'], { timeout: 8000 }).toString().trim() === '1') {
+      log('emulator is back; starting the game');
+      sleep(5000); launchGame(true); sleep(25000); st.lastAction = Date.now(); return true;
+    } } catch (_) { /* still booting */ }
+  }
+  log('the emulator did not come back within 5 minutes');
+  return false;
 }
 
 // One pid file per device, so `--stop` works the same on Windows and Mac and two devices can run side by side.
@@ -617,7 +756,12 @@ function stopBots(onlySerial) {
 }
 
 function main() {
-  if (args.help) { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 15).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')); return; }
+  if (args.help) {   // the comment block at the top of this file
+    const head = [];
+    for (const l of fs.readFileSync(__filename, 'utf8').split('\n').slice(2)) { if (!l.startsWith('//')) break; head.push(l.replace(/^\/\/ ?/, '')); }
+    console.log(head.join('\n'));
+    return;
+  }
   if (args.test) { console.log(describe(readPng(fs.readFileSync(args.test)))); return; }
   serial = args.serial || process.env.SERIAL || process.env.ANDROID_SERIAL || null;
   if (args.devices) {
@@ -626,20 +770,34 @@ function main() {
     return;
   }
   if (args.stop) { stopBots(serial); return; }
-  try { pickDevice(); } catch (e) { console.error(e.message); process.exit(1); }
+  try { ORDER = sourceOrder(); pickDevice(); } catch (e) { console.error(e.message); process.exit(1); }
   if (args.shot) { fs.writeFileSync(args.shot, writePng(screencap())); console.log('saved', args.shot); return; }
   if (args.probe) { console.log(`focus ${JSON.stringify(focus())}`); console.log(describe(screencap())); return; }
 
+  rememberAvdName();
+  if (args.restartEmulator) { process.exit(restartEmulator() ? 0 : 1); }
+
   claimPidFile();
-  log(`ad bot started on ${serial} (mode ${args.mode}${args.loop ? `, loop ${args.loop} min` : ''}${args.max ? `, max ${args.max}` : ''}). Ctrl+C to stop.`);
+  if (args.restartHours === undefined) args.restartHours = args.loop ? DEFAULT_RESTART_HOURS : 0;
+  log(`ad bot started on ${serial}: order ${ORDER.join(' > ')}${args.loop ? `, loop ${args.loop} min` : ''}` +
+    `${args.restartHours ? `, restarting the game every ${args.restartHours} h` : ''}${args.max ? `, max ${args.max}` : ''}. Ctrl+C to stop.`);
   const f0 = focus();
-  if (!f0 || f0.pkg !== GAME) { log('game not in front: launching it'); launchGame(); sleep(8000); }
+  if (!f0 || f0.pkg !== GAME) { log('game not in front: launching it'); launchGame(true); sleep(8000); }
   for (;;) {
-    try { tick(); } catch (e) { log(`error: ${e.message}`); sleep(3000); }
+    try { tick(); st.errors = 0; } catch (e) {
+      log(`error: ${e.message}`);
+      if (++st.errors >= EMULATOR_ERRORS_BEFORE_RESTART && serial.startsWith('emulator-')) {
+        st.errors = 0;
+        try { restartEmulator(); } catch (e2) { log(`emulator restart failed: ${e2.message}`); }
+      }
+      sleep(3000);
+    }
     sleep(TICK_MS);
   }
 }
 
 if (require.main === module) main();
-module.exports = { findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, shopButtonVisible, popupPanelVisible, isTitleScreen,
+// for test.js: set options, run the ad chooser, inspect what it did
+function configure({ order, mode } = {}) { args.order = order; args.mode = mode || 'all'; ORDER = sourceOrder(); }
+module.exports = { chooseAd, configure, restartDue, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
   isMainMenu, isRelayScreen, findRelayPlayAd, findFreeTiles, adDismissTarget, px, minCh };
