@@ -230,6 +230,38 @@ Object.assign(cases, {
   },
 });
 
+// ---- AppLovin "dead" end card: reveal tap + skip pill ---------------------------------------------------------------------
+Object.assign(cases, {
+  'applovin: after 60 s taps the margin then the pill, in one adb call (1520x720)': () => {
+    const img = frame('ad-applovin-max-test-ad.png');
+    bot.st.reveals = 0; bot.st.lastReveal = 0; bot.dryCalls.length = 0;
+    const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
+    assert(!bot.appLovinReveal(f, img, 30000, Date.now()), 'too early: the video may still be playing');
+    assert(bot.appLovinReveal(f, img, 70000, Date.now()));
+    assert.deepStrictEqual(bot.dryCalls, ['shell input tap 198 360; sleep 0.6; input tap 120 42']);
+  },
+  'applovin: only AppLovin ads, and not again within 20 s': () => {
+    const img = frame('ad-applovin-max-test-ad.png'), t = Date.now();
+    bot.st.reveals = 0; bot.st.lastReveal = 0; bot.dryCalls.length = 0;
+    assert(!bot.appLovinReveal({ act: 'com.fyber.inneractive.sdk.activities.InneractiveFullscreenAdActivity' }, img, 90000, t));
+    const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
+    assert(bot.appLovinReveal(f, img, 90000, t));
+    assert(!bot.appLovinReveal(f, img, 95000, t + 5000), 'wait before trying again');
+    assert(bot.appLovinReveal(f, img, 111000, t + 21000));
+  },
+  'applovin: gives up after 5 tries': () => {
+    const img = frame('ad-applovin-max-test-ad.png');
+    bot.st.reveals = 0; bot.st.lastReveal = 0; bot.dryCalls.length = 0;
+    const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
+    let n = 0;
+    for (let i = 0; i < 12; i++) if (bot.appLovinReveal(f, img, 90000, i * 21000 + 1)) n++;
+    assert.strictEqual(n, 5);
+  },
+  'applovin: the end card that follows the skip has an X the corner detector finds': () => {
+    assert(near(bot.findAdCornerX(frame('ad-applovin-skip-end-card.png')), [1464, 48], 8));
+  },
+});
+
 let failed = 0;
 for (const [file, check] of Object.entries(cases)) {
   try {

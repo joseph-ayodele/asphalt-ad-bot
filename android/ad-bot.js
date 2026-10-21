@@ -635,10 +635,29 @@ function gameStep() {
   if (now - st.lastAction > idleMs) idleStop(`nothing to click for ${idleMs / 60000} min: out of ads or on the wrong screen.`);
 }
 
+// AppLovin ads can sit on a static end card for minutes with no UI tree and no visible button, looking dead. The reward is
+// already paid by then (the owner saw it; the coins moved). A tap on the black margin makes a small "▶| Google Play" skip pill
+// fade in at the top left for a couple of seconds, and tapping it ends the ad (it also opens the Play Store, which the bot
+// backs out of, and leaves an end card whose X the corner detector finds). So: reveal tap, then straight away the pill tap,
+// in one adb call so the timing is tight. Only for AppLovin, only once the video must be over, a few tries, and both taps
+// land on black margin if the pill is not there.
+const REVEAL_AFTER_MS = 60000, REVEAL_EVERY_MS = 20000, REVEAL_MAX = 5;
+function appLovinReveal(f, img, ageMs, now) {
+  if (!/applovin/i.test(f.act) || ageMs < REVEAL_AFTER_MS || now - (st.lastReveal || 0) < REVEAL_EVERY_MS || (st.reveals || 0) >= REVEAL_MAX) return false;
+  st.reveals = (st.reveals || 0) + 1;
+  st.lastReveal = now;
+  const x1 = Math.round(img.w * 0.13), y1 = Math.round(img.h * 0.5);       // black margin, left of the portrait ad
+  const x2 = Math.round(img.w * 0.079), y2 = Math.round(img.h * 0.058);    // where the pill appears
+  log(`AppLovin end card with no button: reveal tap, then skip pill at ${x2},${y2} (try ${st.reveals}/${REVEAL_MAX})`);
+  adb(['shell', `input tap ${x1} ${y1}; sleep 0.6; input tap ${x2} ${y2}`]);
+  sleep(2500);
+  return true;
+}
+
 function adStep(f) {
   const now = Date.now();
   st.lastAction = now;   // time spent in an ad is activity, not idleness
-  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; }
+  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; st.reveals = 0; st.lastReveal = 0; }
   log(`ad screen ${f.act.split('.').pop()} (${Math.round((now - st.adStart) / 1000)}s)`);
 
   if (now - st.adStart > AD_TIMEOUT_MS) {
@@ -661,6 +680,7 @@ function adStep(f) {
       if (k) target = { why: 'skip button in ad corner', x: k.x, y: k.y };
     }
   }
+  if (!target && img && appLovinReveal(f, img, now - st.adStart, now)) return;
   if (!target) return;
 
   const key = `${target.why}@${target.x},${target.y}`;
@@ -844,5 +864,5 @@ function main() {
 if (require.main === module) main();
 // for test.js: set options, run the ad chooser, inspect what it did
 function configure({ order, mode } = {}) { args.order = order; args.mode = mode || 'all'; ORDER = sourceOrder(); }
-module.exports = { chooseAd, configure, restartDue, noteDismissTap, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
+module.exports = { chooseAd, configure, restartDue, noteDismissTap, appLovinReveal, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
   isMainMenu, isRelayScreen, findRelayPlayAd, findFreeTiles, adDismissTarget, px, minCh };

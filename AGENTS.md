@@ -99,7 +99,7 @@ detectors; UI-tree reader; ad-source chooser; main loop steps; emulator watchdog
 
 ## Testing
 
-`cd android && node test.js` (45 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
+`cd android && node test.js` (49 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
 the emulator and the tablet, ~20 MB) and the ad-chooser logic in a **dry-run mode** (`AD_BOT_DRY_RUN=1`: no adb calls,
 actions recorded in `dryCalls` / `logLines`). To add a case: `node ad-bot.js --shot samples/<name>.png --serial <id>` on the
 screen, then add an assertion. Always add a negative test when you add a detector (false positives cost real taps).
@@ -224,11 +224,19 @@ shows. The bot used to ignore it (`NEVER_TAP` blocks anything with "open") and w
 ad. `adDismissTarget` now taps it at once, on the skip glyph at the pill's right end. If a Unity ad ever stops paying, this is
 the first thing to suspect: look for `Unity skip (reward already paid)` in the log and revert that rule.
 
-## Known weak spot: dead AppLovin playable ads
+## AppLovin "dead" end cards (fixed on the owner's tip; verified by hand, the automated version not yet seen live)
 
-An AppLovin ad on AD REWARDS froze with no close button on both the tablet and the emulator (the emulator one ran 106+ s on
-screen, then hit the 4-minute timeout, three BACK presses and a game restart, losing that ad's reward). They take about 6
-minutes to clear. A faster detector (screen unchanged for ~90 s with no close target) would save time. Not done.
+(The paragraph below replaces an earlier "known weak spot" note about dead AppLovin playables.)
+
+AppLovin MAX test ads ("Congrats! You're seeing a test ad.") can sit on a static end card for minutes with **no UI tree at all
+and no visible button**. The bot took them for dead and waited out the 4-minute timeout, three BACKs and a game restart
+(about 6 minutes each). They are not dead and **the reward is already paid** (coins moved +50,000 and wrench +25,000 across
+that ad and a relay one). The owner's tip: tap the screen and a small "▶| Google Play" skip pill fades in at the top left for
+only a couple of seconds. Tapping it ends the ad, opens the Play Store (the bot backs out) and leaves an end card with an X at
+the top right that `findAdCornerX` finds. So `appLovinReveal`: after 60 s on an AppLovin activity with no target, one adb call
+taps the black margin (0.13w, 0.5h) then 0.6 s later the pill (0.079w, 0.058h), at most 5 tries 20 s apart. Both taps land on
+black margin if the pill is not there. The tablet's frozen "Bus Fever" playable was probably the same kind of thing but was
+never tested with this trick (BACK did nothing there).
 
 ## Ideas not done
 
