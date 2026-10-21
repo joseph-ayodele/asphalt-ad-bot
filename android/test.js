@@ -90,8 +90,10 @@ const treeCases = {
   'Install Now is never tapped': [[node({ cls: 'Button', text: 'Install Now' })], false],
   'Skip Open Store is never tapped': [[node({ cls: 'Button', text: 'Skip Open Store' })], false],
   'plain video, nothing to tap': [[node({ cls: 'WebView', text: 'Ad Player', clickable: false })], false],
+  'AdMob "Skip" is left alone early in an ad': [[node({ cls: 'Button', desc: 'Skip' })], false],
+  'AdMob "Skip" is tapped once the ad has been up 80 s': [[node({ cls: 'Button', desc: 'Skip' })], true, 80000],
 };
-for (const [name, [nodes, want]] of Object.entries(treeCases)) cases[`tree: ${name}`] = () => assert.strictEqual(!!bot.adDismissTarget(nodes), want);
+for (const [name, [nodes, want, age]] of Object.entries(treeCases)) cases[`tree: ${name}`] = () => assert.strictEqual(!!bot.adDismissTarget(nodes, age), want);
 
 // ---- which ad is played next ----------------------------------------------------------------------------------------
 // The default order is AD RELAY OFFERS, AD REWARDS, wrench, coin. A better source that is due always beats a worse one that

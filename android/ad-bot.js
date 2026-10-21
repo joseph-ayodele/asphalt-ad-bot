@@ -72,6 +72,9 @@ function adb(args, opts = {}) {
       ? 'adb not found. Install Android platform-tools, or set the ADB environment variable to the adb executable.'
       : `adb failed: ${r.error.message}`);
   }
+  // a vanished device (the emulator crashed, the cable came out) is an error, not an empty answer
+  const err = r.stderr ? r.stderr.toString('utf8') : '';
+  if (r.status !== 0 && /not found|no devices|offline|unauthorized|closed/i.test(err)) throw new Error(`adb: ${err.trim().split('\n')[0]}`);
   return r.stdout;
 }
 
@@ -370,7 +373,7 @@ function uiNodes() {
 const NEVER_TAP = /install|download|learn more|more info|open|get it|play now|shop|buy|visit|subscribe|sign up/i;
 
 // Where to tap to move an ad screen along. Ordered by confidence.
-function adDismissTarget(nodes) {
+function adDismissTarget(nodes, ageMs = 0) {
   // Networks label the same button differently: resource id (Fyber), content-desc (Meta, "Close Ad"), or visible text
   // (Unity playables, "Close").
   const close = nodes.find((n) => (/close|dismiss/i.test(`${n.id} ${n.desc}`) || /^(close|dismiss)\b/i.test(n.text)) &&
@@ -379,6 +382,12 @@ function adDismissTarget(nodes) {
   // Store-promo end cards (Digital Turbine / Fyber) dismiss with a small unlabeled svg button in a corner.
   const svg = nodes.find((n) => n.clickable && n.cls === 'Button' && /^svg\+xml/.test(n.text) && n.x2 - n.x1 <= 120 && n.y2 - n.y1 <= 120);
   if (svg) return { why: 'store promo dismiss', x: svg.cx, y: svg.cy };
+  // A plain "Skip" button (AdMob app-install end cards, content-description "Skip"). Skipping a rewarded video early can
+  // forfeit the reward, so it is only used once the ad has been up long enough that any video is over.
+  if (ageMs >= SKIP_BUTTON_AFTER_MS) {
+    const skip = nodes.find((n) => n.clickable && /^skip( ad)?$/i.test((n.desc || n.text).trim()) && n.x2 - n.x1 < 400 && n.y2 > n.y1);
+    if (skip) return { why: 'skip button', x: skip.cx, y: skip.cy };
+  }
   return null;
 }
 
@@ -592,7 +601,9 @@ function gameStep() {
   // activity, so a button that never returns (no ads left) still ends in the idle stop.
   if (!shopButtonVisible(img) && !popupPanelVisible(img) && now - st.lastAction > WAKE_AFTER_QUIET_MS && now - st.lastWake > WAKE_EVERY_MS) {
     st.lastWake = now;
-    const x = Math.round(img.w * 0.78), y = Math.round(img.h * 0.69);
+    // An empty spot at the top, between the profile and the currency bar. (The old spot, on the floor to the right of the
+    // car, is where the driver stands on the tablet's layout, and tapping the driver toggles a close-up that hides the menu.)
+    const x = Math.round(img.w * 0.40), y = Math.round(img.h * 0.04);
     log(`wake click at ${x},${y} (menu buttons hidden)`);
     tap(x, y);
     sleep(1200);
@@ -616,7 +627,7 @@ function adStep(f) {
   }
 
   const nodes = uiNodes();
-  let target = adDismissTarget(nodes);
+  let target = adDismissTarget(nodes, now - st.adStart);
   let img = null;
   if (!target && now - st.adStart > 8000) {
     img = screencap();
@@ -706,6 +717,11 @@ function rememberAvdName() {
 
 function restartEmulator() {
   const exe = emulatorExe();
+  // a dead emulator cannot tell its name; if the machine has only one AVD that must be it
+  if (!st.avdName && exe) {
+    const names = spawnSync(exe, ['-list-avds'], { timeout: 20000 }).stdout?.toString('utf8').split(/\r?\n/).map((s) => s.trim()).filter(Boolean) || [];
+    if (names.length === 1) st.avdName = names[0];
+  }
   if (!st.avdName || !exe) { log('cannot restart the emulator: unknown AVD name or emulator program (set ANDROID_SDK_ROOT)'); return false; }
   log(`restarting the emulator (AVD ${st.avdName})`);
   try { adb(['emu', 'kill'], { timeout: 15000 }); } catch (_) { /* it may be too wedged to answer */ }
@@ -781,8 +797,13 @@ function main() {
   if (args.restartHours === undefined) args.restartHours = args.loop ? DEFAULT_RESTART_HOURS : 0;
   log(`ad bot started on ${serial}: order ${ORDER.join(' > ')}${args.loop ? `, loop ${args.loop} min` : ''}` +
     `${args.restartHours ? `, restarting the game every ${args.restartHours} h` : ''}${args.max ? `, max ${args.max}` : ''}. Ctrl+C to stop.`);
-  const f0 = focus();
-  if (!f0 || f0.pkg !== GAME) { log('game not in front: launching it'); launchGame(true); sleep(8000); }
+  try {
+    const f0 = focus();
+    if (!f0 || f0.pkg !== GAME) { log('game not in front: launching it'); launchGame(true); sleep(8000); }
+  } catch (e) {
+    log(`device not reachable at start (${e.message}); the loop will keep trying${serial.startsWith('emulator-') ? ' and restart the emulator' : ''}`);
+    st.errors = EMULATOR_ERRORS_BEFORE_RESTART - 1;   // a device that is already gone needs the restart after one more failure
+  }
   for (;;) {
     try { tick(); st.errors = 0; } catch (e) {
       log(`error: ${e.message}`);

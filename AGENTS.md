@@ -50,8 +50,10 @@ Docs map: `README.md` (which bot), `android/RUNNING.md` (how to run, background,
   720x1520 @293 dpi, `hw.keyboard=yes`. Serial `emulator-5554`. Old AVDs and the wrong images were deleted.
 - **Tablet**: Samsung Galaxy Tab S11 (SM-X730, Android 16, 2560x1600 landscape), USB debugging on, USB-connected to the PC.
   Same Gameloft account as the emulator.
-- At the end of the last session a bot was running in the background on the tablet (`node ad-bot.js --loop --serial
-  <tablet serial>`); the emulator bot was stopped on purpose.
+- The owner moves the bot between devices. At the end of the last session the tablet had been run until it had seen every
+  ad available to it (then stopped on purpose), the emulator's game was restarted to pull the cloud save (numbers matched the
+  tablet's), and **`node ad-bot.js --loop --serial emulator-5554` was left running overnight**. Check what is running with
+  `ls android/.ad-bot-*.pid` and `node android/ad-bot.js --devices`.
 
 ## Android bot: how it works (`android/ad-bot.js`, ~800 lines, no npm dependencies)
 
@@ -97,7 +99,7 @@ detectors; UI-tree reader; ad-source chooser; main loop steps; emulator watchdog
 
 ## Testing
 
-`cd android && node test.js` (38 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
+`cd android && node test.js` (40 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
 the emulator and the tablet, ~20 MB) and the ad-chooser logic in a **dry-run mode** (`AD_BOT_DRY_RUN=1`: no adb calls,
 actions recorded in `dryCalls` / `logLines`). To add a case: `node ad-bot.js --shot samples/<name>.png --serial <id>` on the
 screen, then add an assertion. Always add a negative test when you add a detector (false positives cost real taps).
@@ -113,7 +115,7 @@ The samples contain the owner's in-game name and currency numbers.
 - **Emulator GPU**: `hw.gpu.mode=host` sent the game into an endless `eglGetConfigAttrib ... EGL_BAD_CONFIG` loop on the
   Gameloft logo. `swangle` (software ANGLE) works. Also: 4 GB RAM thrashed; the 16 KB page-size image was a wrong pick.
 - **The emulator's graphics can freeze after hours idle**: `adb shell` answers but `screencap` never returns. Restart it.
-- The game **hides its menu buttons after a few idle seconds**; a tap on empty floor (0.78w, 0.69h) brings them back.
+- The game **hides its menu buttons after a few idle seconds**; a tap on an empty spot at the top (0.40w, 0.04h) brings them back. Do not tap the floor right of the car: on the tablet that is the driver, and tapping it toggles a close-up that hides the menu.
   `hw.keyboard=yes` makes the game show a "Press any key" overlay at every launch (the bot taps through it).
 - The in-game ad PLAY buttons exist in three places: top-bar coin and wrench buttons, and the two ad screens.
 - Ad networks seen: Fyber/Inneractive (resource-id close button, store-promo card with an unlabeled svg dismiss button),
@@ -122,6 +124,17 @@ The samples contain the owner's in-game name and currency numbers.
   AppLovin (a dead dimmed playable with no close button once; BACK did nothing; a game restart clears it and loses that
   ad's reward). Some ads open Google Play by themselves when they end; BACK returns.
 - Reward screens appear after the ad and the promo popup; NEXT may appear twice.
+- **On the tablet, `screencap` does not capture some ad layers** (an AdMob app-install ad showed only the game underneath);
+  the UI tree still shows it, so ad handling must work from the tree alone. That ad's only way out was a button with
+  content-description **"Skip"**, which is why a "Skip" button is tapped once an ad has been up 75 s (never earlier: it can
+  forfeit the reward).
+- **The emulator process can die outright** (it did once, right after a Vungle ad). `adb` then answers "device not found";
+  that is treated as an error so the watchdog restarts the emulator (verified live: dead emulator to game running in ~40 s).
+  If the bot starts while the emulator is already dead it still recovers. The watchdog finds the AVD name from
+  `emulator -list-avds` when there is exactly one.
+- **Do not wake the menu by tapping the floor right of the car**: on the tablet that is where the driver stands, and tapping
+  the driver toggles a close-up that hides the whole menu (the bot then sees no buttons and idles). The wake tap is an empty
+  spot at the top (0.40w, 0.04h).
 - Pace seen: each ad 25-70 s; about a dozen coin/wrench ads per refresh; the garage buttons came back within about 3 h.
 - Shell gotchas on this PC: Git Bash rewrites `/sdcard/...` paths (set `MSYS_NO_PATHCONV=1`); PowerShell `>` corrupts binary
   output (use `node ad-bot.js --shot` or Git Bash); `Start-Process` with redirected output is how to background a bot;
@@ -138,8 +151,9 @@ focus (verified by the owner). They were not otherwise changed. Their run logs a
 ## Status at the end of the last session
 
 Verified live: coin/wrench buttons; Fyber, AdMob, Meta, Unity ads; AD REWARDS end to end on the tablet; the priority order;
-the emulator restart procedure; `--loop`, `--stop`, device picking. Verified only on saved frames or by unit tests: the
-ironSource skip-button path, the 2-hour game restart, the watchdog's automatic trigger. **Not verified live: the AD RELAY
+the emulator restart procedure and the watchdog's automatic recovery of a dead emulator; `--loop`, `--stop`, device picking;
+the tablet working through AD REWARDS until "COME BACK LATER". Verified only on saved frames or by unit tests: the
+ironSource skip-button path, the AdMob "Skip" button, the 2-hour game restart. **Not verified live: the AD RELAY
 OFFERS PLAY AD! click** (it was exhausted whenever tried; it shares the slot and code with AD REWARDS, and a simulated
 button on the real screen is tested). Unknowns: whether there is a daily cap on ads; whether the third FREE tile that
 appeared on the emulator's main menu matters (the bot only uses the first two); how the Mac behaves.
