@@ -158,6 +158,51 @@ OFFERS PLAY AD! click** (it was exhausted whenever tried; it shares the slot and
 button on the real screen is tested). Unknowns: whether there is a daily cap on ads; whether the third FREE tile that
 appeared on the emulator's main menu matters (the bot only uses the first two); how the Mac behaves.
 
+## Races: a possible fourth ad source (explored, NOT built)
+
+The owner found that finishing a career race offers a rewarded ad ("GET YOUR MULTI-CREDITS!", 116 credits x78 = 9,048, for one
+ad). We walked the whole flow by hand on the emulator (frames in `android/samples/race-*.png`). It works, and the race drives
+itself (autopilot) in about 2.5 minutes. Flow, emulator 1520x720 coordinates:
+
+1. Main menu: **PLAY** (orange, bottom right, 1360,648) -> mode menu: **CAREER** panel (1100,220) -> Season 1 page: first tile
+   **ALPS / Dodge Dart GT** (270,340; all 5 stars, repeatable) -> race info: **NEXT** (white box, the bot already finds it)
+   -> car select: **START RACE** (grey translucent, 1322,640, not found by any detector) -> boosts screen: **START RACE**
+   (white box; never tap APPLY or the green price buttons) -> loading -> race (~2.5 min, no input needed).
+2. After the finish: NEXT (finish cutscene), NEXT (results), **SKIP** (the rewards screen shows 0 until it counts up), then
+   **"Get your multi-credits"**: PLAY AD! is a **green** button. The bot's purchase-safety check refuses green, so it would need a
+   deliberate exception, and the existing NEXT detector would wrongly tap MISS OUT (the white box beside it). The ad is a
+   normal AdMob ad that opens a Play Store page afterwards (BACK). Then "CONGRATULATIONS! TOTAL 9,048" with REPLAY and NEXT.
+3. REPLAY -> "Replay race?" dialog (YES is a white box the NEXT detector finds; NO is left of it) -> a **Vungle interstitial**
+   ad (clean X top-right, in the UI tree) -> presumably straight to the race (not confirmed; the emulator died here).
+4. Finishing also completed a Car Hunt quest: a "CAR HUNT QUEST COMPLETED" popup with NOT NOW / CHECK IT and no X (the bot's
+   BACK fallback would probably close it).
+
+Why the owner's first manual run showed no ad: the rewards screen shows 0 credits until it counts up, and the offer comes on
+the next screen. It was not a missing ad.
+
+To build it: a state machine for step 1 (time-driven taps with a "not the main menu" check), a race state during which the bot
+taps nothing except NEXT (the wake tap and the BACK fallback must be suppressed mid-race: BACK opens the pause menu), a
+green-PLAY-AD detector for the multi-credits screen (green block at x 0.60-0.97, y 0.64-0.79 plus a white REPLAY box at the
+bottom left; the boosts screen's green price buttons start at y 0.80), and REPLAY to loop without the menus. Put it last in the
+priority order (below coin). Not done because the owner asked for something simple running overnight.
+
+**Warning found while exploring: the emulator process died twice, each time with a Vungle ad on screen** (once during an AD
+RELAY/REWARDS run, once after the replay interstitial), with no Windows crash record. The watchdog restarts it in about 40 s.
+`--restart-emulator` and the watchdog now write the emulator's own output to `android/emulator-<avd>.log`, so the next crash
+leaves evidence. Races would add a Vungle ad per replay, so expect more of these.
+
+Also unexplained: the **third FREE tile (megaphone icon, with a timer matching the Car Hunt event) disappeared from the main
+menu after the race**; the bot only uses the first two tiles. The owner mentioned "audio ad relay offers"; this may be what
+they meant. Ask them.
+
+## Overnight setup used last (2026-10-21)
+
+Only the emulator ran: `node ad-bot.js --loop --serial emulator-5554`. The tablet had been run until every ad said
+"COME BACK LATER" and was stopped. The Windows game was running as well; the owner said to simplify, so it was closed (a
+graceful WM_CLOSE, like the X button) and no AutoHotkey bot was run. Reasons: one Gameloft account means shared ad timers and a
+cloud-save mismatch whenever two copies run, and only the Android bot loops, restarts the game and recovers a crashed emulator.
+The AHK bots stop after 3 idle minutes and never resume, so they are not suited to unattended use without a wrapper.
+
 ## Ideas not done
 
 Detect dead playables sooner than the 4-minute timeout; OCR the currency counters to log earnings; per-device config file;

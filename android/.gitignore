@@ -1,4 +1,5 @@
 ad-bot*.log
+emulator-*.log
 run*.out
 run*.err
 .ad-bot-*.pid

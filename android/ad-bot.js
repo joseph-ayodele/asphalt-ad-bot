@@ -731,7 +731,10 @@ function restartEmulator() {
     else spawnSync('pkill', ['-f', `qemu-system.*-avd ${st.avdName}`]);
     sleep(8000);
   }
-  spawn(exe, ['-avd', st.avdName, '-no-snapshot-load'], { detached: true, stdio: 'ignore' }).unref();
+  // keep the emulator's own output: when it dies on its own (it has, twice, right after a Vungle ad) this is the evidence
+  let out = 'ignore';
+  try { out = fs.openSync(path.join(__dirname, `emulator-${st.avdName}.log`), 'a'); } catch (_) { /* log is optional */ }
+  spawn(exe, ['-avd', st.avdName, '-no-snapshot-load'], { detached: true, stdio: ['ignore', out, out] }).unref();
   for (const end = Date.now() + 5 * 60000; Date.now() < end;) {
     sleep(6000);
     try { if (adb(['shell', 'getprop', 'sys.boot_completed'], { timeout: 8000 }).toString().trim() === '1') {
