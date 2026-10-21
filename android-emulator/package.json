@@ -1,0 +1,13 @@
+{
+  "name": "asphalt-ad-bot-android",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Asphalt 8 ad bot for an Android emulator or tablet, driven over ADB",
+  "scripts": {
+    "start": "node ad-bot.js --mode all --loop",
+    "devices": "node ad-bot.js --devices",
+    "probe": "node ad-bot.js --probe",
+    "test": "node test.js"
+  },
+  "engines": { "node": ">=18" }
+}

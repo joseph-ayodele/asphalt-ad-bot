@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 'use strict';
-// Asphalt 8 ad bot for the Android emulator. Runs over ADB, so the emulator window can be covered, unfocused or on
-// another monitor: screenshots come from `screencap`, taps go through `input tap`, and ad screens are read from the
-// UI tree (`uiautomator dump`) where possible.
+// Asphalt 8 ad bot for an Android emulator or a real Android tablet/phone. Runs over ADB, so the emulator window can
+// be covered or on another monitor: screenshots come from `screencap`, taps go through `input tap`, and ad screens are
+// read from the UI tree (`uiautomator dump`) where possible.
 //
-//   node ad-bot.js [--mode garage|coin|wrench|relay] [--max N] [--serial emulator-5554]
+//   node ad-bot.js [--mode all|garage|coin|wrench|relay] [--loop [minutes]] [--max N] [--serial <id>]
+//   node ad-bot.js --devices            list connected devices
+//   node ad-bot.js --stop [--serial <id>]   stop a bot running in the background (all of them without --serial)
 //   node ad-bot.js --probe              one detection pass on the live screen, no taps
 //   node ad-bot.js --shot out.png       save the current screen
 //   node ad-bot.js --test frame.png     run the screen detectors on a saved screenshot
 //
 // Flow: PLAY AD! -> ad plays -> dismiss store promo -> ad close X -> game promo popup X -> NEXT -> repeat.
+// --loop: when no ads are left, wait (default 30 minutes) and check again instead of exiting.
 // Plain Node, no npm packages.
 
 const { spawnSync } = require('child_process');
@@ -53,8 +56,31 @@ let serial = null;
 function adb(args, opts = {}) {
   const full = serial ? ['-s', serial, ...args] : args;
   const r = spawnSync(ADB, full, { maxBuffer: 64 * 1024 * 1024, timeout: opts.timeout || 30000 });
-  if (r.error) throw new Error(`adb failed: ${r.error.message}`);
+  if (r.error) {
+    throw new Error(r.error.code === 'ENOENT'
+      ? 'adb not found. Install Android platform-tools, or set the ADB environment variable to the adb executable.'
+      : `adb failed: ${r.error.message}`);
+  }
   return r.stdout;
+}
+
+// Connected devices: [{ id, kind: 'emulator' | 'device', model }]
+function listDevices() {
+  const r = spawnSync(ADB, ['devices', '-l'], { timeout: 15000 });
+  if (r.error) throw new Error(r.error.code === 'ENOENT' ? 'adb not found. Install Android platform-tools, or set the ADB environment variable.' : r.error.message);
+  return r.stdout.toString('utf8').split('\n').slice(1).map((l) => l.trim().split(/\s+/)).filter((p) => p[1] === 'device')
+    .map((p) => ({ id: p[0], kind: p[0].startsWith('emulator-') ? 'emulator' : 'device', model: ((p.find((x) => x.startsWith('model:')) || '').slice(6)) }));
+}
+
+// With one device connected adb picks it by itself; with several the bot must be told which (--serial or ANDROID_SERIAL).
+function pickDevice() {
+  if (serial) return;
+  const devices = listDevices();
+  if (devices.length === 0) throw new Error('no Android device found. Start the emulator, or plug in the tablet with USB debugging on, then check `adb devices`.');
+  if (devices.length > 1) {
+    throw new Error(`more than one device connected:\n${devices.map((d) => `  ${d.id}  (${d.kind}${d.model ? `, ${d.model}` : ''})`).join('\n')}\nChoose one with --serial <id>.`);
+  }
+  serial = devices[0].id;
 }
 
 const sh = (cmd) => adb(['shell', cmd]).toString('utf8');
@@ -62,8 +88,13 @@ const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 
 
 // Raw framebuffer: 16-byte header (w, h, format, colorspace; 12 bytes on old Android) then RGBA.
 function screencap() {
-  const buf = adb(['exec-out', 'screencap']);
-  if (buf.length < 16) throw new Error('empty screencap (is the emulator running?)');
+  let buf = adb(['exec-out', 'screencap']);
+  // real devices now and then return nothing while the display is changing; one retry is enough
+  if (buf.length < 16) { sleep(600); buf = adb(['exec-out', 'screencap']); }
+  if (buf.length < 16) {
+    adb(['shell', 'input', 'keyevent', '224']);   // KEYCODE_WAKEUP, in case the display went to sleep
+    throw new Error('empty screencap (is the device connected and awake?)');
+  }
   const w = buf.readUInt32LE(0), h = buf.readUInt32LE(4);
   const header = buf.length - w * h * 4;
   if (header !== 12 && header !== 16) throw new Error(`unexpected screencap size ${buf.length} for ${w}x${h}`);
@@ -174,11 +205,26 @@ function countColour(img, x0, y0, x1, y1, pred) {
   return n;
 }
 
-// "AD RELAY OFFERS" screen (opened from the second FREE tile on the main menu): the red TIME LEFT ribbon is its signature.
-const isRelayScreen = (img) => countColour(img, 0.68, 0.19, 1.0, 0.24, (c) => c[0] > 170 && c[1] < 60 && c[2] < 60) > 1000;
+// The red TIME LEFT ribbon on the ad screens ("AD RELAY OFFERS", "AD REWARDS") is a long red bar: at least 20% of the
+// screen width in one row. Nothing else seen so far (popup banners, RACING PASS) is wider than 9%. Its height differs
+// per device, so every row from 10% to 65% down is checked.
+function hasTimeLeftRibbon(img) {
+  const need = Math.round(img.w * 0.2);
+  for (let y = Math.round(img.h * 0.10); y < Math.round(img.h * 0.65); y += 3) {
+    let run = 0;
+    for (let x = 0; x < img.w; x += 2) {
+      const c = px(img, x, y);
+      if (c[0] > 170 && c[1] < 70 && c[2] < 70) { if (++run * 2 >= need) return true; } else run = 0;
+    }
+  }
+  return false;
+}
 
-// Main menu: the big orange PLAY button bottom right, with the SHOP button lit (no popup on top).
-const isMainMenu = (img) => shopButtonVisible(img) && countColour(img, 0.78, 0.82, 0.99, 0.97, isOrange) > 2000;
+const isRelayScreen = hasTimeLeftRibbon;
+
+// Main menu: the big orange PLAY button bottom right, with the SHOP button lit (no popup on top). The ad screens also
+// have an orange button down there, so the ribbon rules them out.
+const isMainMenu = (img) => shopButtonVisible(img) && !hasTimeLeftRibbon(img) && countColour(img, 0.78, 0.82, 0.99, 0.97, isOrange) > 2000;
 
 // PLAY AD! on the relay screen sits in the bottom-right slot, orange. The slot is bounded so the main menu's PLAY
 // button, Lucky Box and purchase buttons never match. Geometry carried over from the Windows bot.
@@ -188,8 +234,29 @@ function findRelayPlayAd(img) {
   return b && b.x <= Math.round(w * 0.80) && b.y <= Math.round(h * 0.93) ? b : null;
 }
 
-// The second FREE tile in the main menu's top-left column opens Ad Relay Offers.
-const relayTile = (img) => ({ x: Math.round(img.w * 0.122), y: Math.round(img.h * 0.233) });
+// The main menu's top-left column has tiles for the ad screens, each topped by a small green FREE tag: the first opens
+// AD REWARDS, the second AD RELAY OFFERS. Their positions differ per device (the tablet has an extra tile), so they
+// are found by their tags. The tag itself is green (a purchase colour for safeTap), so the tap goes just below it, on the
+// icon.
+function findFreeTiles(img) {
+  const pts = [];
+  for (let y = Math.round(img.h * 0.10); y < Math.round(img.h * 0.32); y++)
+    for (let x = Math.round(img.w * 0.02); x < Math.round(img.w * 0.45); x++) {
+      const c = px(img, x, y);
+      if (c[1] > 150 && c[1] - c[0] > 40 && c[1] - c[2] > 90) pts.push([x, y]);
+    }
+  pts.sort((a, b) => a[0] - b[0]);
+  const tags = [];
+  for (const [x, y] of pts) {
+    const t = tags[tags.length - 1];
+    if (t && x - t.maxX <= img.w * 0.02) { t.maxX = x; t.minY = Math.min(t.minY, y); t.maxY = Math.max(t.maxY, y); t.n++; }
+    else tags.push({ minX: x, maxX: x, minY: y, maxY: y, n: 1 });
+  }
+  return tags.filter((t) => t.n > 60).map((t) => {
+    const w = t.maxX - t.minX;
+    return { x: Math.round((t.minX + t.maxX) / 2), y: Math.round((t.minY + t.maxY) / 2 + w * 0.6) };
+  });
+}
 const backArrow = (img) => ({ x: Math.round(img.w * 0.058), y: Math.round(img.h * 0.072) });
 
 // The title screen after a (re)launch: "Press any key to continue" in white at the bottom centre, nothing else down there.
@@ -276,10 +343,14 @@ function adDismissTarget(nodes) {
 // ---------------------------------------------------------------- bot
 
 const args = (() => {
-  const a = { mode: 'garage', max: 0 };
+  const a = { mode: 'all', max: 0, loop: 0 };
   const v = process.argv.slice(2);
   for (let i = 0; i < v.length; i++) {
     if (v[i] === '--mode') a.mode = v[++i];
+    else if (v[i] === '--loop') a.loop = /^\d+(\.\d+)?$/.test(v[i + 1] || '') ? Number(v[++i]) : 30;
+    else if (v[i] === '--devices') a.devices = true;
+    else if (v[i] === '--stop') a.stop = true;
+    else if (v[i] === '--idle-minutes') a.idleMinutes = Number(v[++i]);   // how long with nothing to click counts as "out of ads"
     else if (v[i] === '--max') a.max = Number(v[++i]);
     else if (v[i] === '--serial') a.serial = v[++i];
     else if (v[i] === '--shot') a.shot = v[++i];
@@ -301,7 +372,7 @@ const st = {
   popupWindowUntil: 0, popupBacks: 0, popupSeen: 0, lastBack: 0, returnedAt: 0, lastTitleTap: 0,
   ads: 0, inAd: false, awaitingAd: false, kind: 'coin', adStart: 0, lastPlay: 0, lastAction: Date.now(), lastPopupScan: 0, backs: 0,
   noFillUntil: { coin: 0, wrench: 0, relay: 0 }, lastTarget: '', sameTarget: 0, foreign: 0,
-  relayRecheckAt: 0, lastRelayNav: 0, lastHomeTap: 0, titleSeen: 0, lastWake: 0,
+  tileDoneUntil: [], tileIdx: 0, lastRelayNav: 0, lastHomeTap: 0, titleSeen: 0, lastWake: 0,
 };
 
 function describe(img) {
@@ -324,6 +395,15 @@ function wantsKind(kind) {
 }
 
 const relayEnabled = () => args.mode === 'relay' || args.mode === 'all';
+
+// Out of ads: stop, or with --loop wait and look again (the garage buttons and ad tiles come back over time).
+function idleStop(why) {
+  if (!args.loop) { log(`${why} Stopping.`); process.exit(0); }
+  log(`${why} Checking again in ${args.loop} min.`);
+  sleep(args.loop * 60000);
+  Object.assign(st, { lastAction: Date.now(), lastHomeTap: 0, lastRelayNav: 0, tileDoneUntil: [], noFillUntil: { coin: 0, wrench: 0, relay: 0 } });
+  log('checking for ads again');
+}
 
 function gameStep() {
   const now = Date.now();
@@ -367,21 +447,26 @@ function gameStep() {
         return;
       }
       if (!play && now - st.lastAction > 4000) {
-        log('Ad Relay has no ad ready (COME BACK LATER): leaving');
-        st.relayRecheckAt = now + RELAY_RECHECK_MS;
-        if (args.mode === 'relay') { log('nothing more to do in relay mode. Stopping.'); process.exit(0); }
+        log(`ad screen ${st.tileIdx + 1} has no ad ready (COME BACK LATER): leaving`);
+        st.tileDoneUntil[st.tileIdx] = now + RELAY_RECHECK_MS;
         const b = backArrow(img);
         safeTap(img, b.x, b.y, 'back arrow');
         sleep(2500);
         return;
       }
-    } else if (isMainMenu(img) && now > st.relayRecheckAt && now - st.lastRelayNav > 20000) {
-      st.lastRelayNav = now;
-      const t = relayTile(img);
-      safeTap(img, t.x, t.y, 'opening Ad Relay Offers');
-      sleep(3000);
-      return;
-    } else if (shopButtonVisible(img) && now > st.relayRecheckAt && now - st.lastAction > 15000 && now - st.lastHomeTap > 30000) {
+    } else if (isMainMenu(img) && now - st.lastRelayNav > 20000) {
+      // open the next ad tile that has not just reported "COME BACK LATER"
+      const tiles = findFreeTiles(img);
+      const idx = tiles.findIndex((_, i) => now > (st.tileDoneUntil[i] || 0));
+      if (idx >= 0) {
+        st.lastRelayNav = now;
+        st.tileIdx = idx;
+        safeTap(img, tiles[idx].x, tiles[idx].y, `opening ad tile ${idx + 1} of ${tiles.length}`);
+        sleep(3000);
+        return;
+      }
+      if (args.mode === 'relay') { idleStop('no ad tile has an ad ready.'); return; }
+    } else if (shopButtonVisible(img) && now - st.lastAction > 15000 && now - st.lastHomeTap > 30000 && [0, 1].some((i) => now > (st.tileDoneUntil[i] || 0))) {
       // Parked in the garage (or another submenu) with nothing to play: the home icon leads to the main menu.
       st.lastHomeTap = now;
       safeTap(img, Math.round(img.w * 0.94), Math.round(img.h * 0.072), 'going to the main menu');
@@ -434,10 +519,8 @@ function gameStep() {
     return;
   }
 
-  if (now - st.lastAction > IDLE_STOP_MS) {
-    log(`nothing to click for ${IDLE_STOP_MS / 60000} min: out of ads or on the wrong screen. Stopping.`);
-    process.exit(0);
-  }
+  const idleMs = args.idleMinutes ? args.idleMinutes * 60000 : IDLE_STOP_MS;
+  if (now - st.lastAction > idleMs) idleStop(`nothing to click for ${idleMs / 60000} min: out of ads or on the wrong screen.`);
 }
 
 function adStep(f) {
@@ -505,14 +588,50 @@ function tick() {
   return adStep(f);
 }
 
+// One pid file per device, so `--stop` works the same on Windows and Mac and two devices can run side by side.
+const pidFile = (id) => path.join(__dirname, `.ad-bot-${String(id).replace(/[^\w.-]/g, '_')}.pid`);
+
+function claimPidFile() {
+  const file = pidFile(serial);
+  try {
+    const old = Number(fs.readFileSync(file, 'utf8'));
+    if (old && old !== process.pid) {
+      try { process.kill(old, 0); console.error(`A bot is already running for ${serial} (pid ${old}). Stop it first with --stop.`); process.exit(1); } catch (e) { if (e.code !== 'ESRCH') throw e; }
+    }
+  } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  fs.writeFileSync(file, String(process.pid));
+  const release = () => { try { if (Number(fs.readFileSync(file, 'utf8')) === process.pid) fs.unlinkSync(file); } catch (_) { /* already gone */ } };
+  process.on('exit', release);
+  process.on('SIGINT', () => process.exit(130));
+  process.on('SIGTERM', () => process.exit(143));
+}
+
+function stopBots(onlySerial) {
+  const files = fs.readdirSync(__dirname).filter((f) => /^\.ad-bot-.*\.pid$/.test(f) && (!onlySerial || f === path.basename(pidFile(onlySerial))));
+  if (!files.length) { console.log('no bot is running'); return; }
+  for (const f of files) {
+    const pid = Number(fs.readFileSync(path.join(__dirname, f), 'utf8'));
+    try { process.kill(pid); console.log(`stopped ${f.slice(8, -4)} (pid ${pid})`); } catch (e) { console.log(`${f.slice(8, -4)}: pid ${pid} was not running (${e.code})`); }
+    try { fs.unlinkSync(path.join(__dirname, f)); } catch (_) { /* ignore */ }
+  }
+}
+
 function main() {
-  if (args.help) { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 11).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')); return; }
+  if (args.help) { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 15).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')); return; }
   if (args.test) { console.log(describe(readPng(fs.readFileSync(args.test)))); return; }
-  serial = args.serial || process.env.SERIAL || null;
+  serial = args.serial || process.env.SERIAL || process.env.ANDROID_SERIAL || null;
+  if (args.devices) {
+    const d = listDevices();
+    console.log(d.length ? d.map((x) => `${x.id}  ${x.kind}${x.model ? `  ${x.model}` : ''}`).join('\n') : 'no devices connected');
+    return;
+  }
+  if (args.stop) { stopBots(serial); return; }
+  try { pickDevice(); } catch (e) { console.error(e.message); process.exit(1); }
   if (args.shot) { fs.writeFileSync(args.shot, writePng(screencap())); console.log('saved', args.shot); return; }
   if (args.probe) { console.log(`focus ${JSON.stringify(focus())}`); console.log(describe(screencap())); return; }
 
-  log(`ad bot started (mode ${args.mode}${args.max ? `, max ${args.max}` : ''}). Ctrl+C to stop.`);
+  claimPidFile();
+  log(`ad bot started on ${serial} (mode ${args.mode}${args.loop ? `, loop ${args.loop} min` : ''}${args.max ? `, max ${args.max}` : ''}). Ctrl+C to stop.`);
   const f0 = focus();
   if (!f0 || f0.pkg !== GAME) { log('game not in front: launching it'); launchGame(); sleep(8000); }
   for (;;) {
@@ -523,4 +642,4 @@ function main() {
 
 if (require.main === module) main();
 module.exports = { findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, shopButtonVisible, popupPanelVisible, isTitleScreen,
-  isMainMenu, isRelayScreen, findRelayPlayAd, relayTile, adDismissTarget, px, minCh };
+  isMainMenu, isRelayScreen, findRelayPlayAd, findFreeTiles, adDismissTarget, px, minCh };

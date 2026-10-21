@@ -41,7 +41,22 @@ Object.assign(cases, {
   'main-menu.png': (img) => {
     assert(bot.isMainMenu(img) && !bot.isRelayScreen(img));
     assert(!bot.findRelayPlayAd(img), 'the big PLAY button is not the relay PLAY AD! slot');
-    assert(bot.relayTile(img).x === 185 && bot.relayTile(img).y === 168);
+    const tiles = bot.findFreeTiles(img);   // Ad Rewards, then Ad Relay Offers (the second one was opened by hand: 185,168)
+    assert(tiles.length === 2 && near(tiles[1], [185, 168], 10), JSON.stringify(tiles));
+  },
+  // Galaxy Tab S11 (2560x1600): different layout, an extra left tile, a live AD REWARDS PLAY AD! button.
+  'tablet-main-menu.png': (img) => {
+    assert(bot.isMainMenu(img) && !bot.isRelayScreen(img));
+    assert(!bot.findRelayPlayAd(img), 'the big PLAY button must not look like the ad screens\' PLAY AD!');
+    const tiles = bot.findFreeTiles(img);
+    assert(tiles.length === 2 && near(tiles[0], [299, 350], 12) && near(tiles[1], [492, 352], 12), JSON.stringify(tiles));
+    const plays = bot.findGaragePlayAds(img);
+    assert(plays.length === 1 && plays[0].kind === 'wrench' && near(plays[0], [1582, 216], 15), JSON.stringify(plays));
+  },
+  'tablet-ad-rewards-play-ad.png': (img) => {
+    assert(bot.isRelayScreen(img) && !bot.isMainMenu(img));
+    const b = bot.findRelayPlayAd(img);
+    assert(b && Math.abs(b.cx - 2188) < 30 && Math.abs(b.cy - 1504) < 30, JSON.stringify(b));
   },
   // Relay was exhausted when captured ("COME BACK LATER", grey). A live PLAY AD! is simulated by painting an orange
   // button into the same slot, since the real one only appears when the next ad is ready.
