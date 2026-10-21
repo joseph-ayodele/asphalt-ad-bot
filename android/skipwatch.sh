@@ -9,6 +9,11 @@ work=${SW_DIR:-/data/local/tmp}
 end=$(( $(date +%s) + dur ))
 while [ "$(date +%s)" -lt "$end" ]; do
   uiautomator dump "$work/sw.xml" >/dev/null 2>&1
+  # a Close button means the ad is over and the bot's normal checks should take it from here
+  if grep -q -e 'text="Close"' -e 'content-desc="Close' "$work/sw.xml" 2>/dev/null; then
+    echo close
+    exit 0
+  fi
   line=$(grep -o 'text="Skip Open Store"[^>]*' "$work/sw.xml" 2>/dev/null | head -n 1)
   if [ -n "$line" ]; then
     set -- $(echo "$line" | grep -o 'bounds="[^"]*"' | sed 's/[^0-9]/ /g')

@@ -232,30 +232,41 @@ Object.assign(cases, {
 
 // ---- AppLovin "dead" end card: reveal tap + skip pill ---------------------------------------------------------------------
 Object.assign(cases, {
-  'applovin: after 60 s taps the margin then the pill, in one adb call (1520x720)': () => {
+  'applovin: from 10 s it runs the on-device reveal script (reveal tap at 13%/50%, then reads and taps the pill)': () => {
     const img = frame('ad-applovin-max-test-ad.png');
     bot.st.reveals = 0; bot.st.lastReveal = 0; bot.dryCalls.length = 0;
     const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
-    assert(!bot.appLovinReveal(f, img, 30000, Date.now()), 'too early: the video may still be playing');
-    assert(bot.appLovinReveal(f, img, 70000, Date.now()));
-    assert.deepStrictEqual(bot.dryCalls, ['shell input tap 198 360; sleep 0.6; input tap 120 42']);
+    assert(!bot.appLovinReveal(f, img, 5000, Date.now()), 'too early');
+    assert(bot.appLovinReveal(f, img, 12000, Date.now()));
+    assert(bot.dryCalls.includes('shell sh /data/local/tmp/revealskip.sh 198 360'), JSON.stringify(bot.dryCalls));
   },
-  'applovin: only AppLovin ads, and not again within 20 s': () => {
+  'applovin: only AppLovin ads, and not again within 15 s': () => {
     const img = frame('ad-applovin-max-test-ad.png'), t = Date.now();
     bot.st.reveals = 0; bot.st.lastReveal = 0; bot.dryCalls.length = 0;
     assert(!bot.appLovinReveal({ act: 'com.fyber.inneractive.sdk.activities.InneractiveFullscreenAdActivity' }, img, 90000, t));
     const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
     assert(bot.appLovinReveal(f, img, 90000, t));
     assert(!bot.appLovinReveal(f, img, 95000, t + 5000), 'wait before trying again');
-    assert(bot.appLovinReveal(f, img, 111000, t + 21000));
+    assert(bot.appLovinReveal(f, img, 111000, t + 16000));
   },
-  'applovin: gives up after 5 tries': () => {
+  'applovin: gives up after 6 tries': () => {
     const img = frame('ad-applovin-max-test-ad.png');
     bot.st.reveals = 0; bot.st.lastReveal = 0; bot.dryCalls.length = 0;
     const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
     let n = 0;
     for (let i = 0; i < 12; i++) if (bot.appLovinReveal(f, img, 90000, i * 21000 + 1)) n++;
-    assert.strictEqual(n, 5);
+    assert.strictEqual(n, 6);
+  },
+  'applovin on-device script: finds the REAL tablet pill (80,42-216,55), taps its centre (148,48); with no pill it ends in "none"': () => {
+    if (!haveSh) throw { skip: 'no sh on this machine' };
+    const pill = path.join(__dirname, 'samples', 'ui-applovin-google-play-pill-tablet.xml').replace(/\\/g, '/');
+    const run = (tree) => {
+      const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'revealskip-'));
+      const w = `uiautomator(){ cp "${tree}" "$SW_DIR/rs.xml"; }; input(){ echo "INPUT $*"; }; . "${path.join(__dirname, 'revealskip.sh').replace(/\\/g, '/')}" 333 800`;
+      return spawnSync('sh', ['-c', w], { env: { ...process.env, SW_DIR: dir.replace(/\\/g, '/') }, encoding: 'utf8' }).stdout.trim();
+    };
+    assert.strictEqual(run(pill), 'INPUT tap 333 800\nINPUT tap 148 48\ntapped 148 48');
+    assert.strictEqual(run(noPillTree).split('\n').pop(), 'none');
   },
   'applovin: the tablet\'s privacy end card has a hairline X (9 px arms) top right; it used to be invisible and the bot sat on it': () => {
     assert(near(bot.findAdCornerX(frame('ad-applovin-privacy-card-tablet-x.png')), [2494, 56], 8));
@@ -265,6 +276,37 @@ Object.assign(cases, {
   },
   'applovin: the end card that follows the skip has an X the corner detector finds': () => {
     assert(near(bot.findAdCornerX(frame('ad-applovin-skip-end-card.png')), [1464, 48], 8));
+  },
+});
+
+Object.assign(cases, {
+  'garage buttons: on the tablet the coin button (alone) is found as coin; the 1-pixel probe used to throw it away': () => {
+    const plays = bot.findGaragePlayAds(frame('tablet-main-menu-coin-only.png'));
+    assert.deepStrictEqual(plays.map((p) => p.kind), ['coin']);
+    assert(near(plays[0], [1329, 216], 15), JSON.stringify(plays));
+  },
+  'garage buttons: no false hits on a menu with no PLAY AD! buttons': () => {
+    assert.strictEqual(bot.findGaragePlayAds(frame('main-menu.png')).length, 0);
+    assert.strictEqual(bot.findGaragePlayAds(frame('popup-lucky-strike.png')).length, 0);
+  },
+});
+
+// ---- BidMachine: the skip is a bare "»" glyph, an unlabelled ~46 px clickable image in the top-right corner -----------------
+Object.assign(cases, {
+  'tiny corner skip: the real BidMachine tree gives the » glyph, but only once the ad is 10 s old': () => {
+    const nodes = bot.parseNodes(fs.readFileSync(path.join(__dirname, 'samples', 'ui-bidmachine-tiny-skip.xml'), 'utf8'));
+    assert(!bot.adDismissTarget(nodes, 6000), 'too early: it could forfeit the reward');
+    const t = bot.adDismissTarget(nodes, 15000);
+    assert(t && t.x === 2516 && t.y === 44, JSON.stringify(t));
+  },
+  'tiny corner skip: never the top-left mute button, a labelled button, or a big image': () => {
+    const nodes = bot.parseNodes(fs.readFileSync(path.join(__dirname, 'samples', 'ui-bidmachine-tiny-skip.xml'), 'utf8'))
+      .filter((n) => !(n.x1 > 2000 && n.y1 < 100));          // drop the real » : the mute button (top-left) must not match
+    assert(!bot.adDismissTarget(nodes, 80000));
+    const labelled = [node({ cls: 'ImageView', desc: 'Info', x1: 2493, y1: 21, x2: 2539, y2: 67 }), node({ x1: 0, y1: 0, x2: 2560, y2: 1568 })];
+    assert(!bot.adDismissTarget(labelled, 80000), 'a labelled image is not an unknown skip');
+    const big = [node({ cls: 'ImageView', x1: 2000, y1: 20, x2: 2560, y2: 700 }), node({ x1: 0, y1: 0, x2: 2560, y2: 1568 })];
+    assert(!bot.adDismissTarget(big, 80000), 'a big image is content, not a button');
   },
 });
 
@@ -293,20 +335,27 @@ Object.assign(cases, {
     if (!haveSh) throw { skip: 'no sh on this machine' };
     assert.strictEqual(runSkipwatch([noPillTree, noPillTree, pillTree]), 'INPUT tap 484 111\ntapped 484 111');
   },
+  'unity fast skip: a Close button ends the watch at once ("close"), without tapping it': () => {
+    if (!haveSh) throw { skip: 'no sh on this machine' };
+    const p = path.join(require('os').tmpdir(), 'ui-close.xml');
+    fs.writeFileSync(p, fs.readFileSync(path.join(__dirname, 'samples', 'ui-unity-skip-open-store.xml'), 'utf8').replace(/Skip Open Store/g, 'Close'));
+    assert.strictEqual(runSkipwatch([p.replace(/\\/g, '/')]), 'close');
+  },
   'unity fast skip: with no pill it taps nothing': () => {
     if (!haveSh) throw { skip: 'no sh on this machine' };
     assert.strictEqual(runSkipwatch([noPillTree]), 'none');
   },
-  'unity fast skip: only Unity ads, not before 6 s, at most 6 watches, and never after a skip': () => {
+  'unity fast skip: only Unity ads, not before 6 s, at most 8 watches that never swallow the tick, and never after a skip': () => {
     const f = { act: 'com.unity3d.ads.adplayer.FullScreenWebViewDisplay' }, t = Date.now();
     Object.assign(bot.st, { adStart: t - 20000, unitySkipped: false, watchRuns: 0 }); bot.dryCalls.length = 0;
     assert(!bot.unityFastSkip({ act: 'com.fyber.inneractive.sdk.activities.InneractiveFullscreenAdActivity' }, t), 'not Unity');
     bot.st.adStart = t - 3000;
     assert(!bot.unityFastSkip(f, t), 'too early');
     bot.st.adStart = t - 20000;
-    for (let i = 0; i < 6; i++) assert(bot.unityFastSkip(f, t), `watch ${i + 1}`);
-    assert(!bot.unityFastSkip(f, t), 'gives up after 6 and hands over to the normal checks');
-    assert(bot.dryCalls.filter((c) => c.includes('skipwatch.sh')).length >= 6);
+    for (let i = 0; i < 8; i++) assert(!bot.unityFastSkip(f, t), `watch ${i + 1} never swallows the tick`);
+    assert.strictEqual(bot.dryCalls.filter((c) => c.startsWith('shell sh ') && c.includes('skipwatch.sh')).length, 8);
+    assert(!bot.unityFastSkip(f, t));
+    assert.strictEqual(bot.dryCalls.filter((c) => c.startsWith('shell sh ') && c.includes('skipwatch.sh')).length, 8, 'gives up after 8 watches');
     bot.st.watchRuns = 0; bot.st.unitySkipped = true;
     assert(!bot.unityFastSkip(f, t), 'already skipped');
   },

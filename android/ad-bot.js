@@ -30,7 +30,8 @@ const AD_OPEN_WAIT_MS = 15000;      // PLAY AD! tapped but no ad screen appeared
 const AD_TIMEOUT_MS = 240000;       // ads run up to ~150s; past this, press BACK
 const AMBIGUOUS_WAIT_MS = 8000;     // how long to wait for the menu to settle before taking a lower-priority ad
 const DEFAULT_RESTART_HOURS = 2;    // with --loop, restart the game this often (--restart-hours 0 turns it off)
-const SKIP_BUTTON_AFTER_MS = 75000; // the corner skip button is only tapped once an ad has been up this long
+const CORNER_SKIP_AFTER_MS = 10000; // the tiny unlabelled top-right "»" (BidMachine) is tapped once an ad has been up this long
+const SKIP_BUTTON_AFTER_MS = 10000; // the other late skips (disc, "Skip" button): set to 10 s by the owner (was 75); they only appear once an ad is skippable
 const NO_FILL_BACKOFF_MS = 60000;
 const IDLE_STOP_MS = 300000;        // nothing recognisable for this long -> out of ads or on the wrong screen
 const POPUP_SCAN_EVERY_MS = 2000;
@@ -196,8 +197,18 @@ function findGaragePlayAds(img) {
   for (const c of clusters) {
     if (c.n < 40 || c.maxX - c.minX > Math.round(w * 0.03)) continue;
     const cx = Math.round(c.sumX / c.n), cy = Math.round(c.sumY / c.n);
-    const probe = px(img, cx + Math.round(w * 0.069), cy + Math.round(h * 0.042));
-    const kind = probe[2] > probe[1] + 30 ? 'wrench' : probe[0] > 180 && probe[2] < probe[1] ? 'coin' : null;
+    // Coin or wrench? Both buttons have the same orange plate; the wrench one adds purple coin art. So: enough purple over the plate
+    // to the right of the marker means wrench, otherwise orange/gold means coin. A single probe pixel worked on the emulator but on
+    // the tablet it landed on the grey edge of the coin art, so the coin button was thrown away and never played.
+    let gold = 0, purple = 0;
+    for (let yy = cy + Math.round(h * 0.005); yy < cy + Math.round(h * 0.06); yy += 2) {
+      for (let xx = cx + Math.round(w * 0.012); xx < cx + Math.round(w * 0.085); xx += 2) {
+        const p = px(img, xx, yy);
+        if (p[0] > 180 && p[1] > 100 && p[2] < 100 && p[0] - p[2] > 90) gold++;
+        else if (p[2] > p[1] + 30 && p[0] > 90 && p[2] > 120) purple++;
+      }
+    }
+    const kind = purple >= 40 ? 'wrench' : gold >= 60 ? 'coin' : null;
     if (kind) out.push({ kind, x: cx + Math.round(w * 0.037), y: cy + Math.round(h * 0.039) });
   }
   return out;
@@ -361,7 +372,10 @@ function findSkipButton(img) {
 // ---------------------------------------------------------------- ui tree
 
 function uiNodes() {
-  const xml = adb(['exec-out', 'uiautomator', 'dump', '/dev/tty'], { timeout: 20000 }).toString('utf8');
+  return parseNodes(adb(['exec-out', 'uiautomator', 'dump', '/dev/tty'], { timeout: 20000 }).toString('utf8'));
+}
+
+function parseNodes(xml) {
   const nodes = [];
   for (const m of xml.matchAll(/<node [^>]*>/g)) {
     const g = (k) => (m[0].match(new RegExp(` ${k}="([^"]*)"`)) || [])[1] || '';
@@ -393,6 +407,15 @@ function adDismissTarget(nodes, ageMs = 0) {
   if (svg) return { why: 'store promo dismiss', x: svg.cx, y: svg.cy };
   // A plain "Skip" button (AdMob app-install end cards, content-description "Skip"). Skipping a rewarded video early can
   // forfeit the reward, so it is only used once the ad has been up long enough that any video is over.
+  // BidMachine ads: the skip is a bare "»" glyph, a ~46 px clickable image with no text and no label, in the top-right corner
+  // (the mute button is the same kind of image, top-left). Tapping it moves on to the playable end card, whose close button is
+  // the same sort of corner image, so the same rule then finds that. The owner chose 10 s.
+  if (ageMs >= CORNER_SKIP_AFTER_MS) {
+    const maxX = Math.max(0, ...nodes.map((n) => n.x2));
+    const corner = nodes.find((n) => n.cls === 'ImageView' && n.clickable && !n.text && !n.desc && n.x2 - n.x1 <= 100 && n.y2 - n.y1 <= 100 &&
+      n.x1 > maxX * 0.85 && n.y1 < 200);
+    if (corner) return { why: 'tiny corner button (skip / close)', x: corner.cx, y: corner.cy };
+  }
   if (ageMs >= SKIP_BUTTON_AFTER_MS) {
     const skip = nodes.find((n) => n.clickable && /^skip( ad)?$/i.test((n.desc || n.text).trim()) && n.x2 - n.x1 < 400 && n.y2 > n.y1);
     if (skip) return { why: 'skip button', x: skip.cx, y: skip.cy };
@@ -642,19 +665,25 @@ function gameStep() {
 // AppLovin ads can sit on a static end card for minutes with no UI tree and no visible button, looking dead. The reward is
 // already paid by then (the owner saw it; the coins moved). A tap on the black margin makes a small "▶| Google Play" skip pill
 // fade in at the top left for a couple of seconds, and tapping it ends the ad (it also opens the Play Store, which the bot
-// backs out of, and leaves an end card whose X the corner detector finds). So: reveal tap, then straight away the pill tap,
-// in one adb call so the timing is tight. Only for AppLovin, only once the video must be over, a few tries, and both taps
-// land on black margin if the pill is not there.
-const REVEAL_AFTER_MS = 60000, REVEAL_EVERY_MS = 20000, REVEAL_MAX = 5;
+// backs out of, and leaves an end card whose X the corner detector finds). The pill's position is a fixed physical size, NOT a
+// fraction of the screen: a blind tap tuned on the emulator (0.058 of the height) landed 45 px too low on the tablet and missed
+// three times. So revealskip.sh runs ON the device: reveal tap, dump the tree while the pill is up, read where the
+// "Google Play" label really is, tap it. Only for AppLovin, a few tries; the reveal tap lands harmlessly if there is no pill.
+// The gate is 10 s like the other skips (owner's call; AppLovin's end cards were seen to have paid already).
+const REVEAL_AFTER_MS = 10000, REVEAL_EVERY_MS = 15000, REVEAL_MAX = 6;
+const REVEALSKIP_REMOTE = '/data/local/tmp/revealskip.sh';
+let revealskipPushed = false;
 function appLovinReveal(f, img, ageMs, now) {
   if (!/applovin/i.test(f.act) || ageMs < REVEAL_AFTER_MS || now - (st.lastReveal || 0) < REVEAL_EVERY_MS || (st.reveals || 0) >= REVEAL_MAX) return false;
   st.reveals = (st.reveals || 0) + 1;
   st.lastReveal = now;
-  const x1 = Math.round(img.w * 0.13), y1 = Math.round(img.h * 0.5);       // black margin, left of the portrait ad
-  const x2 = Math.round(img.w * 0.079), y2 = Math.round(img.h * 0.058);    // where the pill appears
-  log(`AppLovin end card with no button: reveal tap, then skip pill at ${x2},${y2} (try ${st.reveals}/${REVEAL_MAX})`);
-  adb(['shell', `input tap ${x1} ${y1}; sleep 0.6; input tap ${x2} ${y2}`]);
-  sleep(2500);
+  const x1 = Math.round(img.w * 0.13), y1 = Math.round(img.h * 0.5);       // somewhere neutral to reveal the pill
+  if (!revealskipPushed) { adb(['push', path.join(__dirname, 'revealskip.sh'), REVEALSKIP_REMOTE]); revealskipPushed = true; }
+  const out = adb(['shell', 'sh', REVEALSKIP_REMOTE, String(x1), String(y1)], { timeout: 30000 }).toString('utf8').trim();
+  const m = out.match(/tapped (\d+) (\d+)/);
+  log(m ? `AppLovin skip pill found and tapped at ${m[1]},${m[2]} (try ${st.reveals}/${REVEAL_MAX})`
+        : `AppLovin: revealed, but no skip pill showed (try ${st.reveals}/${REVEAL_MAX})`);
+  sleep(2000);
   return true;
 }
 
@@ -663,7 +692,7 @@ function appLovinReveal(f, img, ageMs, now) {
 // on the device in skipwatch.sh. It watches for up to 8 s per call, a few calls per ad; the normal checks resume afterwards
 // (and they still catch the Close button). The reward is already paid when the pill appears.
 const SKIPWATCH_REMOTE = '/data/local/tmp/skipwatch.sh';
-const SKIPWATCH_SECONDS = 8, SKIPWATCH_MAX_RUNS = 6, SKIPWATCH_START_MS = 6000;
+const SKIPWATCH_SECONDS = 6, SKIPWATCH_MAX_RUNS = 8, SKIPWATCH_START_MS = 6000;
 let skipwatchPushed = false;
 
 function unityFastSkip(f, now) {
@@ -677,8 +706,12 @@ function unityFastSkip(f, now) {
     log(`Unity skip (reward already paid) at ${m[1]},${m[2]}, caught by the on-device watcher (run ${st.watchRuns})`);
     st.lastAction = Date.now();
     sleep(1500);
+    return true;
   }
-  return true;
+  if (/close/.test(out)) st.unitySkipped = true;   // the ad is over: stop watching
+  // Never hold the tick: whatever the watcher saw, the normal checks (Close button, corner X) run straight after it, so a close
+  // button that appears mid-watch waits at most one watch (8 s), not the whole series.
+  return false;
 }
 
 function adStep(f) {
@@ -829,9 +862,13 @@ function claimPidFile() {
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
   fs.writeFileSync(file, String(process.pid));
   const release = () => { try { if (Number(fs.readFileSync(file, 'utf8')) === process.pid) fs.unlinkSync(file); } catch (_) { /* already gone */ } };
-  process.on('exit', release);
-  process.on('SIGINT', () => process.exit(130));
-  process.on('SIGTERM', () => process.exit(143));
+  // say why we stopped: a bot that vanishes without a line in its log (it did once) is impossible to diagnose
+  process.on('exit', (code) => { log(`bot exiting (code ${code})`); release(); });
+  process.on('uncaughtException', (e) => { log(`uncaught exception: ${e && e.stack || e}`); process.exit(1); });
+  // Deliberately NO SIGINT/SIGTERM/SIGHUP handlers. The main loop is synchronous (blocking adb calls and sleeps), so the event loop
+  // never runs and a handler would never fire; worse, registering one switches off Node's default "terminate on Ctrl+C", which made
+  // Ctrl+C do nothing. Ctrl+C now kills the process immediately; the stale pid file it leaves behind is recognised as dead and
+  // replaced on the next start (see above).
 }
 
 function stopBots(onlySerial) {
@@ -893,5 +930,5 @@ function main() {
 if (require.main === module) main();
 // for test.js: set options, run the ad chooser, inspect what it did
 function configure({ order, mode } = {}) { args.order = order; args.mode = mode || 'all'; ORDER = sourceOrder(); }
-module.exports = { chooseAd, configure, restartDue, noteDismissTap, appLovinReveal, unityFastSkip, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
+module.exports = { chooseAd, configure, restartDue, noteDismissTap, appLovinReveal, unityFastSkip, parseNodes, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
   isMainMenu, isRelayScreen, findRelayPlayAd, findFreeTiles, adDismissTarget, px, minCh };

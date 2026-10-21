@@ -99,7 +99,7 @@ detectors; UI-tree reader; ad-source chooser; main loop steps; emulator watchdog
 
 ## Testing
 
-`cd android && node test.js` (55 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
+`cd android && node test.js` (61 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
 the emulator and the tablet, ~20 MB) and the ad-chooser logic in a **dry-run mode** (`AD_BOT_DRY_RUN=1`: no adb calls,
 actions recorded in `dryCalls` / `logLines`). To add a case: `node ad-bot.js --shot samples/<name>.png --serial <id>` on the
 screen, then add an assertion. Always add a negative test when you add a detector (false positives cost real taps).
@@ -244,8 +244,10 @@ The "Skip Open Store" rule above never fired on the tablet (0 taps in a day) bec
 and a check from the PC (adb dump, parse in Node, adb tap) takes 0.4 to 7 s while a video animates. The owner also pointed out
 the button is "ready" yet hides. `android/skipwatch.sh` now runs **on the device**: it loops `uiautomator dump`, greps the tree
 for `Skip Open Store`, computes the tap (45% of the pill's height in from its right edge) and taps, all in one process.
-`unityFastSkip` pushes and runs it for up to 8 s per call, up to 6 calls per Unity ad, starting 6 s in; normal checks resume
-afterwards (they still find the Close button). Tablet pill bounds seen: [125,61][529,161] (top left); emulator: top right.
+`unityFastSkip` pushes and runs it for up to 6 s per call, up to 8 calls per Unity ad, starting 6 s in. **It must never hold the
+tick**: the first version returned "handled" after every watch, so a Close button or corner X that appeared mid-watch waited
+up to 48 s (seen live: an 11 s delay). Now the normal checks (Close button, corner X) run straight after every watch, and the
+script exits with `close` the moment a Close node appears. Tablet pill bounds seen: [125,61][529,161] (top left); emulator: top right.
 `.gitattributes` forces LF on `*.sh` so Windows checkouts do not break the script. If it still misses, the next step is blind
 taps on the pill's known spots, or a faster loop than uiautomator allows.
 
@@ -257,6 +259,44 @@ saw nothing and the bot sat on the card, doing useless reveal taps, until the ow
 a third size (0.33 x the base), **only in the top-right corner**, because in the top-left it matches the "play-skip" glyph of
 AppLovin's Google Play pill. Tests cover both. Lesson: when a close button is visible on screen and the bot ignores it,
 measure the glyph in a saved frame before touching anything else.
+
+## Coin ads never ran on the tablet; Ctrl+C did nothing (both fixed)
+
+- **Coin vs wrench**: `findGaragePlayAds` found the red marker but decided coin/wrench from ONE pixel right of it. On the tablet that
+  pixel is the grey edge of the coin art, so the coin button was discarded: **0 coin ads ever started on the tablet** (11 wrench).
+  Both buttons share the same orange plate; the wrench one adds purple coin art. Now: >= 40 purple pixels over the plate means
+  wrench, otherwise >= 60 orange/gold means coin. The tablet menu showed the coin button the whole time (frame:
+  `samples/tablet-main-menu-coin-only.png`). Lesson: when a button is visibly on screen and never played, trace the detector
+  on that exact frame.
+- **Ctrl+C**: the main loop is synchronous (blocking adb calls and sleeps), so Node never runs signal handlers, and registering a
+  SIGINT handler switches off the default "terminate on Ctrl+C". I had added handlers for exit logging; they made Ctrl+C a no-op.
+  Removed. Never add SIGINT/SIGTERM handlers to this bot. Ctrl+C leaves a stale pid file, which the next start replaces
+  (it checks whether that pid is alive). `node ad-bot.js --stop` from another terminal always works.
+
+## BidMachine tiny "»" skip (added on the owner's report; the tap verified by hand, the automated rule only unit-tested)
+
+BidMachine ads (activity `io.bidmachine.rendering.ad.fullscreen.FullScreenActivity`) have no Close/Skip text. Their skip is a bare
+**"»"** glyph: a ~46 px clickable ImageView with empty text and content-desc, top right (bounds [2493,21][2539,67] on the tablet),
+next to a same-kind mute image top left. The bot sat on it for minutes. Tapping it by hand moved the ad on to its playable end card
+("Tiles Survive!" loading), which has the same kind of corner image for its own close. `adDismissTarget` now taps an unlabelled
+clickable ImageView <= 100 px in the top-right corner, but only once the ad is 10 s old (the owner chose 10 s; skipping earlier might forfeit the reward;
+we do not know when BidMachine pays: **check the first BidMachine ad, if the coins did not rise, raise `CORNER_SKIP_AFTER_MS`**). Sample: `samples/ui-bidmachine-tiny-skip.xml`. `parseNodes` was split out of `uiNodes` so tests
+can feed it real trees.
+
+## Time gates (owner decision, 2026-10-21)
+
+`CORNER_SKIP_AFTER_MS` and `SKIP_BUTTON_AFTER_MS` are both **10 s** (the latter was 75 s): the owner wants skips caught sooner and saw rewards
+paid before skip buttons appear. These are "do not tap before the ad is this old" gates, not polling intervals; the bot looks every ~3-5 s
+(a UI dump takes 0.4-7 s). If an ad type stops paying, raise the gate first.
+
+## AppLovin skip pill: tapped by what it IS, not where it was on the emulator (verified live on the tablet)
+
+The blind reveal-then-tap (pill at 0.058 of the height) worked on the emulator and **missed three times on the tablet**: the pill is
+a fixed physical size, so on the 2560x1600 tablet it is at y ~ 48, not 93. `android/revealskip.sh` now runs on the device: reveal tap,
+`uiautomator dump` while the pill is up, read the bounds of the "Google Play" label, tap its centre (tablet: 80,42-216,55 -> 148,48).
+Verified on a live "Total Battle" playable: it tapped 148,48, the ad ended into the Play Store (the bot backs out). Gate is now 10 s
+(was 60 s), 6 tries 15 s apart. General lesson, now seen twice: **UI offsets that are physical sizes (pills, glyphs, buttons) do not
+scale with the screen; read them from the tree or the frame, never hard-code a fraction.**
 
 ## Ideas not done
 
