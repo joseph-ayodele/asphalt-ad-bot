@@ -548,6 +548,22 @@ function idleStop(why) {
   log('checking for ads again');
 }
 
+// Loop breaker. A real ad produces at most a handful of NEXT/OK and popup-X taps; a screen the bot misreads can produce one
+// every few seconds for as long as it stays up (one such loop ran 4.5 minutes overnight, until the game happened to leave the
+// foreground). Too many dismiss taps in a short window means we are not getting anywhere: restart the game.
+const LOOP_TAPS = 14, LOOP_WINDOW_MS = 120000;
+function noteDismissTap(now) {
+  st.dismissTaps = (st.dismissTaps || []).filter((t) => now - t < LOOP_WINDOW_MS);
+  st.dismissTaps.push(now);
+  if (st.dismissTaps.length < LOOP_TAPS) return false;
+  st.dismissTaps = [];
+  log(`tap loop: ${LOOP_TAPS} NEXT/popup taps in ${LOOP_WINDOW_MS / 1000} s, restarting the game`);
+  launchGame(true);
+  sleep(25000);
+  st.lastAction = Date.now();
+  return true;
+}
+
 function gameStep() {
   const now = Date.now();
   if (st.inAd) {
@@ -571,14 +587,14 @@ function gameStep() {
   }
 
   const next = findNext(img);
-  if (next) { safeTap(img, next.cx, next.cy, 'NEXT/OK'); sleep(1500); return; }
+  if (next) { safeTap(img, next.cx, next.cy, 'NEXT/OK'); noteDismissTap(Date.now()); sleep(1500); return; }
 
   if (now - st.lastPlay > PLAY_COOLDOWN_MS && chooseAd(img, now)) return;
 
   if (now - st.lastAction > QUIET_BEFORE_POPUP_SCAN_MS && now - st.lastPopupScan > POPUP_SCAN_EVERY_MS) {
     st.lastPopupScan = now;
     const p = findPopupX(img);
-    if (p) { safeTap(img, p.x, p.y, 'popup X'); sleep(1500); return; }
+    if (p) { safeTap(img, p.x, p.y, 'popup X'); noteDismissTap(Date.now()); sleep(1500); return; }
     // Some popups draw a faint translucent X that no pixel test can tell from the artwork. BACK closes every popup
     // seen so far, but it also leaves menus, so only press it in the stretch right after an ad where popups appear.
     if (now < st.popupWindowUntil && st.popupBacks < MAX_POPUP_BACKS && now - st.lastBack > 3500 && now - st.returnedAt > 6000) {
@@ -823,5 +839,5 @@ function main() {
 if (require.main === module) main();
 // for test.js: set options, run the ad chooser, inspect what it did
 function configure({ order, mode } = {}) { args.order = order; args.mode = mode || 'all'; ORDER = sourceOrder(); }
-module.exports = { chooseAd, configure, restartDue, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
+module.exports = { chooseAd, configure, restartDue, noteDismissTap, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
   isMainMenu, isRelayScreen, findRelayPlayAd, findFreeTiles, adDismissTarget, px, minCh };

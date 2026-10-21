@@ -99,7 +99,7 @@ detectors; UI-tree reader; ad-source chooser; main loop steps; emulator watchdog
 
 ## Testing
 
-`cd android && node test.js` (40 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
+`cd android && node test.js` (43 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
 the emulator and the tablet, ~20 MB) and the ad-chooser logic in a **dry-run mode** (`AD_BOT_DRY_RUN=1`: no adb calls,
 actions recorded in `dryCalls` / `logLines`). To add a case: `node ad-bot.js --shot samples/<name>.png --serial <id>` on the
 screen, then add an assertion. Always add a negative test when you add a detector (false positives cost real taps).
@@ -203,6 +203,18 @@ Only the emulator ran: `node ad-bot.js --loop --serial emulator-5554`. The table
 graceful WM_CLOSE, like the X button) and no AutoHotkey bot was run. Reasons: one Gameloft account means shared ad timers and a
 cloud-save mismatch whenever two copies run, and only the Android bot loops, restarts the game and recovers a crashed emulator.
 The AHK bots stop after 3 idle minutes and never resume, so they are not suited to unattended use without a wrapper.
+
+## First unattended night (emulator only, ~8 h): what it did
+
+13 ads (4 AD RELAY OFFERS, 8 AD REWARDS, 1 other), 3 scheduled 2-hour game restarts, 1 stuck ad (a 240 s timeout and a game
+restart), no emulator crashes, no errors. Coins 2,350,934 -> 2,375,934. The game rolled over to new events overnight (new Car
+Hunt and Special Event; the third FREE tile came back with 22h). One flaw: at 09:02 UTC the bot spent 4.5 minutes alternating
+NEXT/OK taps (1372,676 and 1120,676) and a popup X (1320,111) on a screen it misread, after opening AD RELAY OFFERS
+(that tap landed at x=201, between the layouts the tile row has with and without the leading document icon), until the game
+left the foreground by itself. The screen was not captured. **Fix: a loop breaker** (`noteDismissTap`): 14 NEXT/OK or popup-X
+taps within 2 minutes restarts the game. If that ever fires, save a frame at that moment and find out what screen it is.
+
+Timestamps in the bot's logs are **UTC** (the owner's PC is 5 hours behind).
 
 ## Known weak spot: dead AppLovin playable ads
 

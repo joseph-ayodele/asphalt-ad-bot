@@ -198,6 +198,30 @@ Object.assign(cases, {
   },
 });
 
+// ---- loop breaker ---------------------------------------------------------------------------------------------------
+Object.assign(cases, {
+  'loop breaker: a normal ad (a few NEXT/popup taps) never trips it': () => {
+    bot.st.dismissTaps = []; bot.dryCalls.length = 0;
+    const t0 = Date.now();
+    for (let i = 0; i < 5; i++) assert(!bot.noteDismissTap(t0 + i * 3000));
+    assert(!bot.dryCalls.some((c) => c.includes('force-stop')));
+  },
+  'loop breaker: 14 taps in two minutes restarts the game once, then starts over': () => {
+    bot.st.dismissTaps = []; bot.dryCalls.length = 0; bot.logLines.length = 0;
+    const t0 = Date.now();
+    let tripped = 0;
+    for (let i = 0; i < 14; i++) if (bot.noteDismissTap(t0 + i * 4000)) tripped++;
+    assert.strictEqual(tripped, 1);
+    assert(bot.dryCalls.some((c) => c.includes('force-stop')) && /tap loop/.test(bot.logLines.join(' ')));
+    assert(!bot.noteDismissTap(t0 + 60000), 'the count restarts after a trip');
+  },
+  'loop breaker: slow taps spread over hours never trip it': () => {
+    bot.st.dismissTaps = []; bot.dryCalls.length = 0;
+    const t0 = Date.now();
+    for (let i = 0; i < 40; i++) assert(!bot.noteDismissTap(t0 + i * 600000));
+  },
+});
+
 let failed = 0;
 for (const [file, check] of Object.entries(cases)) {
   try {
