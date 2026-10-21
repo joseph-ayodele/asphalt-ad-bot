@@ -257,20 +257,72 @@ Object.assign(cases, {
     for (let i = 0; i < 12; i++) if (bot.appLovinReveal(f, img, 90000, i * 21000 + 1)) n++;
     assert.strictEqual(n, 5);
   },
+  'applovin: the tablet\'s privacy end card has a hairline X (9 px arms) top right; it used to be invisible and the bot sat on it': () => {
+    assert(near(bot.findAdCornerX(frame('ad-applovin-privacy-card-tablet-x.png')), [2494, 56], 8));
+  },
+  'applovin: the "play-skip / Google Play" pill glyph is not mistaken for an X': () => {
+    assert(!bot.findAdCornerX(frame('ad-applovin-max-skip-pill.png')));
+  },
   'applovin: the end card that follows the skip has an X the corner detector finds': () => {
     assert(near(bot.findAdCornerX(frame('ad-applovin-skip-end-card.png')), [1464, 48], 8));
   },
 });
 
-let failed = 0;
+// ---- Unity "Skip Open Store" pill: caught by a script that runs on the device ------------------------------------------------
+const { spawnSync } = require('child_process');
+const haveSh = !spawnSync('sh', ['-c', 'true']).error;
+const SKIP = Symbol('skip');
+function runSkipwatch(trees) {   // trees: file the stubbed `uiautomator dump` copies on each look, in order (last one repeats)
+  const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'skipwatch-'));
+  const stub = trees.map((t, i) => `[ "$n" = ${i + 1} ] && cp "${t}" "$SW_DIR/sw.xml"`).join('; ');
+  const wrapper = `n=0; uiautomator(){ n=$((n+1)); ${stub}; [ "$n" -gt ${trees.length} ] && cp "${trees[trees.length - 1]}" "$SW_DIR/sw.xml"; }; input(){ echo "INPUT $*"; }; . "${path.join(__dirname, 'skipwatch.sh').replace(/\\/g, '/')}" 4`;
+  return spawnSync('sh', ['-c', wrapper], { env: { ...process.env, SW_DIR: dir.replace(/\\/g, '/') }, encoding: 'utf8' }).stdout.trim();
+}
+const pillTree = path.join(__dirname, 'samples', 'ui-unity-skip-open-store.xml').replace(/\\/g, '/');
+const noPillTree = (() => {   // the same real tree with the pill's label changed
+  const p = path.join(require('os').tmpdir(), 'ui-no-pill.xml');
+  fs.writeFileSync(p, fs.readFileSync(path.join(__dirname, 'samples', 'ui-unity-skip-open-store.xml'), 'utf8').replace(/Skip Open Store/g, 'Privacy info'));
+  return p.replace(/\\/g, '/');
+})();
+Object.assign(cases, {
+  'unity fast skip: the device script taps the skip end of the real pill (484,111)': () => {
+    if (!haveSh) throw { skip: 'no sh on this machine' };
+    assert.strictEqual(runSkipwatch([pillTree]), 'INPUT tap 484 111\ntapped 484 111');
+  },
+  'unity fast skip: a pill that only flashes up on the 3rd look is still caught': () => {
+    if (!haveSh) throw { skip: 'no sh on this machine' };
+    assert.strictEqual(runSkipwatch([noPillTree, noPillTree, pillTree]), 'INPUT tap 484 111\ntapped 484 111');
+  },
+  'unity fast skip: with no pill it taps nothing': () => {
+    if (!haveSh) throw { skip: 'no sh on this machine' };
+    assert.strictEqual(runSkipwatch([noPillTree]), 'none');
+  },
+  'unity fast skip: only Unity ads, not before 6 s, at most 6 watches, and never after a skip': () => {
+    const f = { act: 'com.unity3d.ads.adplayer.FullScreenWebViewDisplay' }, t = Date.now();
+    Object.assign(bot.st, { adStart: t - 20000, unitySkipped: false, watchRuns: 0 }); bot.dryCalls.length = 0;
+    assert(!bot.unityFastSkip({ act: 'com.fyber.inneractive.sdk.activities.InneractiveFullscreenAdActivity' }, t), 'not Unity');
+    bot.st.adStart = t - 3000;
+    assert(!bot.unityFastSkip(f, t), 'too early');
+    bot.st.adStart = t - 20000;
+    for (let i = 0; i < 6; i++) assert(bot.unityFastSkip(f, t), `watch ${i + 1}`);
+    assert(!bot.unityFastSkip(f, t), 'gives up after 6 and hands over to the normal checks');
+    assert(bot.dryCalls.filter((c) => c.includes('skipwatch.sh')).length >= 6);
+    bot.st.watchRuns = 0; bot.st.unitySkipped = true;
+    assert(!bot.unityFastSkip(f, t), 'already skipped');
+  },
+});
+
+let failed = 0, skipped = 0;
 for (const [file, check] of Object.entries(cases)) {
   try {
     check(file.endsWith('.png') ? readPng(fs.readFileSync(path.join(__dirname, 'samples', file))) : null);
     console.log(`ok   ${file}`);
   } catch (e) {
+    if (e && e.skip) { skipped++; console.log(`skip ${file}: ${e.skip}`); continue; }
     failed++;
     console.log(`FAIL ${file}: ${e.message}`);
   }
 }
+if (skipped) console.log(`${skipped} skipped`);
 console.log(failed ? `${failed} failed` : 'all passed');
 process.exit(failed ? 1 : 0);

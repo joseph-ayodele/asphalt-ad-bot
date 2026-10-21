@@ -99,7 +99,7 @@ detectors; UI-tree reader; ad-source chooser; main loop steps; emulator watchdog
 
 ## Testing
 
-`cd android && node test.js` (49 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
+`cd android && node test.js` (55 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
 the emulator and the tablet, ~20 MB) and the ad-chooser logic in a **dry-run mode** (`AD_BOT_DRY_RUN=1`: no adb calls,
 actions recorded in `dryCalls` / `logLines`). To add a case: `node ad-bot.js --shot samples/<name>.png --serial <id>` on the
 screen, then add an assertion. Always add a negative test when you add a detector (false positives cost real taps).
@@ -237,6 +237,26 @@ the top right that `findAdCornerX` finds. So `appLovinReveal`: after 60 s on an 
 taps the black margin (0.13w, 0.5h) then 0.6 s later the pill (0.079w, 0.058h), at most 5 tries 20 s apart. Both taps land on
 black margin if the pill is not there. The tablet's frozen "Bus Fever" playable was probably the same kind of thing but was
 never tested with this trick (BACK did nothing there).
+
+## Unity skip pill that flashes (on-device watcher; unit-tested and run once on the tablet, not yet seen catching a live pill)
+
+The "Skip Open Store" rule above never fired on the tablet (0 taps in a day) because the pill is on screen for about a second
+and a check from the PC (adb dump, parse in Node, adb tap) takes 0.4 to 7 s while a video animates. The owner also pointed out
+the button is "ready" yet hides. `android/skipwatch.sh` now runs **on the device**: it loops `uiautomator dump`, greps the tree
+for `Skip Open Store`, computes the tap (45% of the pill's height in from its right edge) and taps, all in one process.
+`unityFastSkip` pushes and runs it for up to 8 s per call, up to 6 calls per Unity ad, starting 6 s in; normal checks resume
+afterwards (they still find the Close button). Tablet pill bounds seen: [125,61][529,161] (top left); emulator: top right.
+`.gitattributes` forces LF on `*.sh` so Windows checkouts do not break the script. If it still misses, the next step is blind
+taps on the pill's known spots, or a faster loop than uiautomator allows.
+
+## Tablet AppLovin privacy end card: hairline X (fixed, verified live)
+
+On the Tab S11 an AppLovin ad ended on a "Privacy Management / GET / Interested / Not interested" card whose only exit is a
+hairline ✕ at the top right (arms ~9 px, 2560x1600). The corner detector only tried glyph halves of ~27 and ~18 px, so it
+saw nothing and the bot sat on the card, doing useless reveal taps, until the owner noticed. `findAdCornerX` now also tries
+a third size (0.33 x the base), **only in the top-right corner**, because in the top-left it matches the "play-skip" glyph of
+AppLovin's Google Play pill. Tests cover both. Lesson: when a close button is visible on screen and the bot ignores it,
+measure the glyph in a saved frame before touching anything else.
 
 ## Ideas not done
 

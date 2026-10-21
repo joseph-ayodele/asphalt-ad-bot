@@ -321,12 +321,16 @@ const findPopupX = (img) => findXShape(img, Math.round(img.w * 0.45), 0, img.w, 
 // Ad screens: X in either top corner. Networks draw it at different sizes (arms of about 12 px or 8 px), so both are tried.
 function findAdCornerX(img) {
   const s = Math.round(Math.min(img.w, img.h) * 0.16);
-  const big = Math.max(4, Math.round(Math.min(img.w, img.h) * 0.034) >> 1), small = Math.max(4, Math.round(big * 0.67));
-  for (const half of [big, small]) {
+  const big = Math.max(4, Math.round(Math.min(img.w, img.h) * 0.034) >> 1);
+  // AppLovin's privacy end card on the 2560x1600 tablet draws a hairline X only ~9 px per arm; the others are larger
+  // That hairline size is only searched in the top-right corner: in the top-left it matches the "play-skip" glyph of
+  // AppLovin's Google Play pill, which is not an X.
+  const sizes = [big, Math.max(4, Math.round(big * 0.67))];
+  for (const half of [...new Set(sizes)]) {
     const found = findXShape(img, img.w - s, 0, img.w, s, 40, 200, 1, 1, half) || findXShape(img, 0, 0, s, s, 40, 200, 1, 1, half);
     if (found) return found;
   }
-  return null;
+  return findXShape(img, img.w - s, 0, img.w, s, 40, 200, 1, 1, Math.max(4, Math.round(big * 0.33)));
 }
 
 // Some networks (ironSource, Unity) show a translucent round "skip" button (a flat grey disc with a white ⏭ glyph) in
@@ -654,10 +658,33 @@ function appLovinReveal(f, img, ageMs, now) {
   return true;
 }
 
+// Unity's "Skip Open Store" pill is up for about a second. A check from here (dump over adb, parse, tap over adb) takes 0.4 to
+// 7 s and kept missing it (zero skips in a day, though the rule existed), so for Unity ads the dump, the parse and the tap run
+// on the device in skipwatch.sh. It watches for up to 8 s per call, a few calls per ad; the normal checks resume afterwards
+// (and they still catch the Close button). The reward is already paid when the pill appears.
+const SKIPWATCH_REMOTE = '/data/local/tmp/skipwatch.sh';
+const SKIPWATCH_SECONDS = 8, SKIPWATCH_MAX_RUNS = 6, SKIPWATCH_START_MS = 6000;
+let skipwatchPushed = false;
+
+function unityFastSkip(f, now) {
+  if (!/unity3d/i.test(f.act) || st.unitySkipped || (st.watchRuns || 0) >= SKIPWATCH_MAX_RUNS || now - st.adStart < SKIPWATCH_START_MS) return false;
+  if (!skipwatchPushed) { adb(['push', path.join(__dirname, 'skipwatch.sh'), SKIPWATCH_REMOTE]); skipwatchPushed = true; }
+  st.watchRuns = (st.watchRuns || 0) + 1;
+  const out = adb(['shell', 'sh', SKIPWATCH_REMOTE, String(SKIPWATCH_SECONDS)], { timeout: (SKIPWATCH_SECONDS + 15) * 1000 }).toString('utf8').trim();
+  const m = out.match(/tapped (\d+) (\d+)/);
+  if (m) {
+    st.unitySkipped = true;
+    log(`Unity skip (reward already paid) at ${m[1]},${m[2]}, caught by the on-device watcher (run ${st.watchRuns})`);
+    st.lastAction = Date.now();
+    sleep(1500);
+  }
+  return true;
+}
+
 function adStep(f) {
   const now = Date.now();
   st.lastAction = now;   // time spent in an ad is activity, not idleness
-  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; st.reveals = 0; st.lastReveal = 0; }
+  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; st.reveals = 0; st.lastReveal = 0; st.unitySkipped = false; st.watchRuns = 0; }
   log(`ad screen ${f.act.split('.').pop()} (${Math.round((now - st.adStart) / 1000)}s)`);
 
   if (now - st.adStart > AD_TIMEOUT_MS) {
@@ -665,6 +692,8 @@ function adStep(f) {
     else { log('ad timeout: BACK'); back(); st.adStart = now - AD_TIMEOUT_MS + 30000; }
     return;
   }
+
+  if (unityFastSkip(f, now)) return;
 
   const nodes = uiNodes();
   let target = adDismissTarget(nodes, now - st.adStart);
@@ -864,5 +893,5 @@ function main() {
 if (require.main === module) main();
 // for test.js: set options, run the ad chooser, inspect what it did
 function configure({ order, mode } = {}) { args.order = order; args.mode = mode || 'all'; ORDER = sourceOrder(); }
-module.exports = { chooseAd, configure, restartDue, noteDismissTap, appLovinReveal, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
+module.exports = { chooseAd, configure, restartDue, noteDismissTap, appLovinReveal, unityFastSkip, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
   isMainMenu, isRelayScreen, findRelayPlayAd, findFreeTiles, adDismissTarget, px, minCh };

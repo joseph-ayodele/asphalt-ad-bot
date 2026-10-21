@@ -1,0 +1,2 @@
+# runs on the Android device: must keep LF endings even when checked out on Windows
+*.sh text eol=lf
