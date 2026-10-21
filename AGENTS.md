@@ -191,9 +191,10 @@ RELAY/REWARDS run, once after the replay interstitial), with no Windows crash re
 `--restart-emulator` and the watchdog now write the emulator's own output to `android/emulator-<avd>.log`, so the next crash
 leaves evidence. Races would add a Vungle ad per replay, so expect more of these.
 
-Also unexplained: the **third FREE tile (megaphone icon, with a timer matching the Car Hunt event) disappeared from the main
-menu after the race**; the bot only uses the first two tiles. The owner mentioned "audio ad relay offers"; this may be what
-they meant. Ask them.
+The **third FREE tile (megaphone icon, a timer matching the Car Hunt event) is the owner's "audio ad relay offers"**: it lists
+the rewards for playing and listening to ads in the game. It was missing from the main menu right after a race but came back
+after the game restarted (7h 08m), so it is not consumed by racing. The owner decided it takes too many steps and should
+**not** be automated; the bot deliberately uses only the first two tiles (`TILE_SOURCES`).
 
 ## Overnight setup used last (2026-10-21)
 
@@ -202,6 +203,12 @@ Only the emulator ran: `node ad-bot.js --loop --serial emulator-5554`. The table
 graceful WM_CLOSE, like the X button) and no AutoHotkey bot was run. Reasons: one Gameloft account means shared ad timers and a
 cloud-save mismatch whenever two copies run, and only the Android bot loops, restarts the game and recovers a crashed emulator.
 The AHK bots stop after 3 idle minutes and never resume, so they are not suited to unattended use without a wrapper.
+
+## Known weak spot: dead AppLovin playable ads
+
+An AppLovin ad on AD REWARDS froze with no close button on both the tablet and the emulator (the emulator one ran 106+ s on
+screen, then hit the 4-minute timeout, three BACK presses and a game restart, losing that ad's reward). They take about 6
+minutes to clear. A faster detector (screen unchanged for ~90 s with no close target) would save time. Not done.
 
 ## Ideas not done
 
