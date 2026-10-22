@@ -96,6 +96,23 @@ set `ANDROID_SDK_ROOT`).
 | `garage` | `--order wrench,coin` |
 | `coin`, `wrench` | just that button |
 
+## When the bot cannot find a close button: it asks Claude
+
+The bot's own rules handle most ads. When an ad has been on screen for **60 seconds** and none of them can find anything to tap
+(a new ad network, a faint or tiny button), the bot sends a picture of the two top corners of the screen to Claude (the cheap
+Haiku model, through the `claude` command) and asks where the close or skip control is. It only taps an answer that passes its own
+checks: the label must say close, skip or X (never install, download, learn more, buy, open, play, mute or info), the spot must not
+be a green purchase colour, and a spot that already did nothing is not tried again. If a restart leaves the game stuck on a message
+with a single OK button, it asks about that too, but never answers a question with two or more choices.
+
+- **Needs** a logged-in `claude` command: run `claude auth login` once. If the login expires, the bot says so in its log, switches
+  this feature off for the run after two failures, and carries on with its normal rules.
+- **Limits**: at most 3 questions per ad, 25 seconds apart, 150 per day. Each takes about 10 seconds and costs roughly 1.5 to 2 cents
+  at API prices (it uses your Claude Code login, not an API key). The day's count is in `ai-usage.json`.
+- **Flags**: `--no-ai` never asks; `--ai-after 30` asks after 30 seconds instead of 60; `--ai-daily-max 50` lowers the daily cap.
+- **In the log** look for `Claude (call 1/3 for this ad, 10 s, today 4 calls ~$0.07): tapping "Close (X)" at 2487,105`.
+- The pictures are sent to Anthropic: ad screens and, for the stuck-screen question, your game screen (it shows your driver name).
+
 ## Run it in the background
 
 Close-the-window-and-keep-going versions. `--stop` works the same on both systems.

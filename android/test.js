@@ -83,7 +83,10 @@ Object.assign(cases, {
 // never be tapped.
 const node = (o) => ({ cls: 'View', id: '', desc: '', text: '', clickable: true, x1: 0, y1: 0, x2: 60, y2: 60, cx: 30, cy: 30, ...o });
 const treeCases = {
-  'Fyber close button by resource id': [[node({ id: 'x:id/ia_clickable_close_button' })], true],
+  'Fyber close button by resource id (trusted after the 10 s grace period)': [[node({ id: 'x:id/ia_clickable_close_button' })], true, 15000],
+  'a close button known only by resource id is not trusted in the first seconds of an ad': [[node({ id: 'x:id/ia_clickable_close_button' })], false, 3000],
+
+  'ironSource closeButton (the real one) is a target once the grace period is over': [[node({ id: 'com.x:id/closeButton', x1: 2440, y1: 70, x2: 2520, y2: 150 })], true, 15000],
   'Fyber store-promo dismiss (svg button)': [[node({ cls: 'Button', text: 'svg+xml;base64,PHN2' })], true],
   'Meta "Close Ad" by content-desc': [[node({ desc: 'Close Ad' })], true],
   'Unity playable "Close" by text': [[node({ cls: 'Button', text: 'Close' })], true],
@@ -288,6 +291,149 @@ Object.assign(cases, {
   'garage buttons: no false hits on a menu with no PLAY AD! buttons': () => {
     assert.strictEqual(bot.findGaragePlayAds(frame('main-menu.png')).length, 0);
     assert.strictEqual(bot.findGaragePlayAds(frame('popup-lucky-strike.png')).length, 0);
+  },
+});
+
+// ---- stuck screens after a game restart: press the ONE button of a single-button dialog, never answer a two-button question -------
+Object.assign(cases, {
+  'dialog OK: the two-button "Replay race?" dialog (NO + YES) is never matched: those questions belong to the owner': () => {
+    assert.strictEqual(bot.findSingleOkButton(frame('race-replay-confirm.png')), null);
+  },
+  'dialog OK: the same dialog with the NO button blanked out has exactly one button: it is found (the YES at 996,550)': () => {
+    const img = frame('race-replay-confirm.png');
+    const one = { w: img.w, h: img.h, data: Buffer.from(img.data) };
+    for (let y = 510; y < 590; y++) for (let x = 360; x < 690; x++) one.data.set([40, 120, 200, 255], (y * one.w + x) * 4);   // paint over NO with the panel colour
+    const ok = bot.findSingleOkButton(one);
+    assert(ok && near({ x: ok.cx, y: ok.cy }, [996, 550], 25), JSON.stringify(ok));
+  },
+  'dialog OK: no ordinary screen has a single-OK match (main menus, ad screens, popups, reward screens, the tablet)': () => {
+    const bad = fs.readdirSync(path.join(__dirname, 'samples')).filter((f) => f.endsWith('.png') && f !== 'race-replay-confirm.png')
+      .filter((f) => bot.findSingleOkButton(frame(f)));
+    assert.deepStrictEqual(bad, []);
+  },
+});
+
+Object.assign(cases, {
+  'skip disc: an ironSource ad dimmed to near black (disc 10, glyph 26, background 6) still finds the faint skip button (tablet, 2488,104)': () => {
+    assert(near(bot.findSkipButton(frame('ad-ironsource-dimmed-skip-tablet.png')), [2488, 104], 10));
+  },
+  'skip disc: pure black and the other dark screens (title, loading) never produce a skip button': () => {
+    const black = { w: 2560, h: 1600, data: Buffer.alloc(2560 * 1600 * 4, 0) };
+    for (let i = 3; i < black.data.length; i += 4) black.data[i] = 255;
+    assert.strictEqual(bot.findSkipButton(black), null);
+    const noisy = { w: 2560, h: 1600, data: Buffer.alloc(2560 * 1600 * 4, 0) };       // compression noise: values 0-3
+    for (let i = 0; i < noisy.data.length; i += 4) { const v = (i / 4 * 7) % 4; noisy.data.set([v, v, v, 255], i); }
+    assert.strictEqual(bot.findSkipButton(noisy), null);
+    assert.strictEqual(bot.findSkipButton(frame('title-press-any-key.png')), null);
+  },
+});
+
+Object.assign(cases, {
+  // The real tree from the stuck Marines ad (ironSource): the sliver `mrail_close` (2547,6-2560,95) comes before the real `closeButton`
+  // (2460,76-2505,142). The wrapper is not banned (it closed 12 ads at their end), but once it rests the real button is chosen.
+  'resting: on the real ironSource tree, once the mrail decoys rest, the real closeButton is chosen': () => {
+    const nodes = bot.parseNodes(fs.readFileSync(path.join(__dirname, 'samples', 'ui-ironsource-decoy-and-real-close.xml'), 'utf8'));
+    const first = bot.adDismissTarget(nodes, 60000);
+    assert(first && /mrail_close/.test(first.why), 'without resting the first match is still the mrail one: ' + JSON.stringify(first));
+    const resting = new Set();
+    let t = first;
+    for (let i = 0; i < 4 && t && /mrail/.test(t.why); i++) { resting.add(`${t.x},${t.y}`); t = bot.adDismissTarget(nodes, 60000, resting); }
+    assert(t && /closeButton/.test(t.why) && near(t, [2482, 109], 4), JSON.stringify(t));
+  },
+});
+
+// ---- "Ask Claude" fallback: everything except the call itself is tested, with a fake `claude` ------------------------------------
+const ai = require('./ai');
+const fakeClaude = (answer, { isError = false, result } = {}) => () => ({
+  status: 0,
+  stdout: JSON.stringify({ type: 'system' }) + '\n' + JSON.stringify({ type: 'result', is_error: isError, result: result !== undefined ? result : JSON.stringify(answer), structured_output: isError ? undefined : answer, total_cost_usd: 0.02 }) + '\n',
+});
+const dark = (w, h) => { const d = Buffer.alloc(w * h * 4); for (let i = 0; i < d.length; i += 4) d.set([8, 8, 8, 255], i); return { w, h, data: d }; };
+const aiAd = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
+function aiReset() {
+  process.env.AD_BOT_AI_USAGE_FILE = path.join(require('os').tmpdir(), `ai-usage-test-${process.pid}.json`);
+  try { fs.unlinkSync(process.env.AD_BOT_AI_USAGE_FILE); } catch (_) { /* none yet */ }
+  Object.assign(bot.st, { aiRuns: 0, lastAi: 0, aiFails: 0, aiDisabled: false, resting: new Map(), adStart: Date.now() - 90000 });
+  bot.args.noAi = false; bot.args.aiAfter = undefined; bot.args.aiDailyMax = undefined;
+  bot.dryCalls.length = 0; bot.logLines.length = 0;
+}
+
+Object.assign(cases, {
+  'ai: the corner image is two 640x400 full-resolution crops with a divider, and the right panel maps back to the right corner': () => {
+    const img = { w: 2560, h: 1600, data: Buffer.alloc(2560 * 1600 * 4, 200) };
+    img.data.set([255, 0, 0, 255], (50 * 2560 + 2540) * 4);                        // a red dot 20 px from the right edge, y=50
+    const c = ai.buildCornerImage(img);
+    assert.strictEqual(c.w, 1290); assert.strictEqual(c.h, 400);
+    assert.deepStrictEqual([...c.data.subarray((50 * 1290 + 650 + 620) * 4, (50 * 1290 + 650 + 620) * 4 + 3)], [255, 0, 0]);
+    assert.deepStrictEqual(ai.mapCornerPoint(1270, 50, c.panels), { x: 2540, y: 50 });
+    assert.deepStrictEqual(ai.mapCornerPoint(93, 130, c.panels), { x: 93, y: 130 });
+    assert.strictEqual(ai.mapCornerPoint(645, 50, c.panels), null, 'the divider is not a place');
+    assert.strictEqual(ai.mapCornerPoint(100, 450, c.panels), null, 'below the crop');
+  },
+  'ai: a dark screen is brightened before it is sent, a bright one is left alone': () => {
+    assert(ai.buildCornerImage(frame('ad-ironsource-dimmed-skip-tablet.png')).gain > 4, 'the dimmed ironSource ad needs a big gain');
+    assert.strictEqual(ai.buildCornerImage(frame('ad-admob-reward-granted-x.png')).gain, 1);
+  },
+  'ai: labels - close and skip controls pass; install, download, buy, open, mute, info, privacy and price labels never do': () => {
+    for (const l of ['Close ad button (X)', 'Skip arrow (>>)', 'skip button', 'X', 'Close', 'Skip Ad']) assert(ai.labelAllowed(l), l);
+    for (const l of ['Install Now', 'Learn more', 'Download', 'PLAY NOW', 'Mute', 'Info (i)', 'Privacy', 'GET', 'Play Ad', 'Open Store', 'Buy now', '$11.99', '']) assert(!ai.labelAllowed(l), l);
+    for (const l of ['OK', 'Close', 'Continue', 'Got it']) assert(ai.labelAllowed(l, 'dialog'), l);
+    for (const l of ['Yes', 'NO', 'CHECK IT', 'Replay', 'Install', 'Update', 'Buy']) assert(!ai.labelAllowed(l, 'dialog'), l);
+  },
+  'ai: askCorners turns the model\'s composite coordinates into real screen coordinates (tablet right corner)': () => {
+    ai.setRunner(fakeClaude({ action: 'tap', x: 1217, y: 105, label: 'Close ad button (X)' }));
+    const r = ai.askCorners({ w: 2560, h: 1600, data: Buffer.alloc(2560 * 1600 * 4, 90) });
+    ai.setRunner(null);
+    assert.strictEqual(r.x, 2487); assert.strictEqual(r.y, 105); assert.strictEqual(r.label, 'Close ad button (X)');
+  },
+  'ai: "none", an answer on the divider, a login failure and garbage are all handled without a tap': () => {
+    const img = { w: 2560, h: 1600, data: Buffer.alloc(2560 * 1600 * 4, 90) };
+    ai.setRunner(fakeClaude({ action: 'none' })); assert(ai.askCorners(img).none);
+    ai.setRunner(fakeClaude({ action: 'tap', x: 645, y: 50, label: 'X' })); assert(ai.askCorners(img).outside);
+    ai.setRunner(fakeClaude(null, { isError: true, result: 'Failed to authenticate: OAuth session expired' }));
+    assert.throws(() => ai.askCorners(img), /claude auth login/);
+    ai.setRunner(() => ({ status: 0, stdout: 'not json', stderr: '' })); assert.throws(() => ai.askCorners(img), /no result/);
+    ai.setRunner(() => ({ error: Object.assign(new Error('x'), { code: 'ENOENT' }) })); assert.throws(() => ai.askCorners(img), /not found/);
+    ai.setRunner(null);
+  },
+  'ai: asked only for an ad that has overstayed 60 s, 25 s apart, 3 times per ad, within the daily cap, and not with --no-ai': () => {
+    aiReset(); const t = Date.now();
+    assert(!bot.aiDue(t, 30000), 'too early');
+    assert(bot.aiDue(t, 65000));
+    bot.st.lastAi = t - 10000; assert(!bot.aiDue(t, 65000), 'too soon after the last question');
+    bot.st.lastAi = t - 30000; bot.st.aiRuns = 3; assert(!bot.aiDue(t, 65000), 'per-ad cap');
+    bot.st.aiRuns = 0; bot.args.noAi = true; assert(!bot.aiDue(t, 65000), '--no-ai');
+    bot.args.noAi = false; bot.args.aiAfter = 20; assert(bot.aiDue(t, 25000), '--ai-after 20');
+    bot.args.aiAfter = undefined; bot.args.aiDailyMax = 2; ai.recordUsage(0.02); ai.recordUsage(0.02); assert(!bot.aiDue(t, 65000), 'daily cap');
+    bot.st.aiDisabled = true; bot.args.aiDailyMax = undefined; assert(!bot.aiDue(t, 65000), 'switched off after failures');
+  },
+  'ai: a good answer is tapped; a bad label, a repeated spot, a purchase-green pixel or an ad that already ended is not': () => {
+    const img = frame('tablet-ad-rewards-play-ad.png');          // 2560x1600
+    const run = (answer, focusAct) => {
+      aiReset(); bot.setFocusProbe(() => ({ pkg: 'x', act: focusAct || aiAd.act }));
+      ai.setRunner(fakeClaude(answer));
+      const r = bot.aiAssist(aiAd, img, Date.now(), bot.st.resting);
+      ai.setRunner(null); bot.setFocusProbe(null);
+      return { r, taps: bot.dryCalls.filter((c) => c.includes('input tap')), log: bot.logLines.join(' | ') };
+    };
+    let o = run({ action: 'tap', x: 1217, y: 105, label: 'Close ad button (X)' });
+    assert(o.r === true && o.taps.length === 1 && /tapping "Close ad button/.test(o.log), JSON.stringify(o));
+    assert(bot.st.resting.has('2487,105'), 'the tapped spot rests so it is not suggested again at once');
+    o = run({ action: 'tap', x: 1217, y: 105, label: 'Install Now' }); assert(o.taps.length === 0 && /refused to tap "Install Now"/.test(o.log), o.log);
+    o = run({ action: 'none' }); assert(o.taps.length === 0 && /no close or skip control/.test(o.log), o.log);
+    aiReset(); bot.st.resting.set('2487,105', Date.now() + 10000); bot.setFocusProbe(() => ({ pkg: 'x', act: aiAd.act })); ai.setRunner(fakeClaude({ action: 'tap', x: 1217, y: 105, label: 'X' }));
+    const again = bot.aiAssist(aiAd, img, Date.now(), bot.st.resting); ai.setRunner(null); bot.setFocusProbe(null);
+    assert(again === false && bot.dryCalls.filter((c) => c.includes('input tap')).length === 0, 'a spot that already did nothing is not tapped again');
+    o = run({ action: 'tap', x: 1217, y: 105, label: 'Close' }, 'com.gameloft.android.ANMP.GloftA8HM.MainActivity');
+    assert(o.taps.length === 0 && /ad ended while waiting/.test(o.log), o.log);
+  },
+  'ai: two failures in a row (for example the login expired) switch the fallback off for the run instead of retrying forever': () => {
+    const img = frame('tablet-ad-rewards-play-ad.png');
+    aiReset(); ai.setRunner(fakeClaude(null, { isError: true, result: 'Failed to authenticate' }));
+    assert.strictEqual(bot.aiAssist(aiAd, img, Date.now(), bot.st.resting), false); assert(!bot.st.aiDisabled);
+    assert.strictEqual(bot.aiAssist(aiAd, img, Date.now(), bot.st.resting), false); assert(bot.st.aiDisabled);
+    ai.setRunner(null);
+    assert(/switched off/.test(bot.logLines.join(' ')));
   },
 });
 

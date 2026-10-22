@@ -99,7 +99,7 @@ detectors; UI-tree reader; ad-source chooser; main loop steps; emulator watchdog
 
 ## Testing
 
-`cd android && node test.js` (61 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
+`cd android && node test.js` (77 checks at last count). It runs the detectors on `android/samples/*.png` (real frames from
 the emulator and the tablet, ~20 MB) and the ad-chooser logic in a **dry-run mode** (`AD_BOT_DRY_RUN=1`: no adb calls,
 actions recorded in `dryCalls` / `logLines`). To add a case: `node ad-bot.js --shot samples/<name>.png --serial <id>` on the
 screen, then add an assertion. Always add a negative test when you add a detector (false positives cost real taps).
@@ -297,6 +297,54 @@ a fixed physical size, so on the 2560x1600 tablet it is at y ~ 48, not 93. `andr
 Verified on a live "Total Battle" playable: it tapped 148,48, the ad ended into the Play Store (the bot backs out). Gate is now 10 s
 (was 60 s), 6 tries 15 s apart. General lesson, now seen twice: **UI offsets that are physical sizes (pills, glyphs, buttons) do not
 scale with the screen; read them from the tree or the frame, never hard-code a fraction.**
+
+## Stuck after a game restart ("server maintenance" dialog): handler built blind, NOT yet seen on a real dialog
+
+After a game restart (stuck ad or the 2-hour restart) the bot spent about 2 minutes "wake clicking" every 9 s (12 to 95 clicks seen),
+and the owner says the cause is a server-maintenance dialog with an OK button. We never captured it. So, deliberately conservative:
+
+- `findSingleOkButton`: after 2 wake clicks in a row with the menu not lit, tap a dialog button **only if it is the ONLY white
+  button in the middle of the screen** (a filled, button-sized blob with dark text). Two-button dialogs (the cloud-save prompt,
+  "Replay race?") never match, so the bot cannot answer a question that belongs to the owner. Verified: no hit on any of the 27 saved
+  frames; the real "Replay race?" dialog with NO painted out yields the lone YES. Unverified on the actual maintenance dialog.
+- After 4 wake clicks it saves the frame to `android/stuck/stuck-<time>.png` (git-ignored, newest 15 kept) and logs the name.
+  **If it is still stuck, ask the owner for that file (or a tablet screenshot) and fit the detector to the real dialog.**
+
+## Dim ironSource skip, and a decoy "close" that caused 23 BACKs mid-ad (found 2026-10-22; fixed, unit-tested, not yet seen live)
+
+- **Dimmed skip disc.** Some ironSource ads dim the whole screen to near black (tablet: disc brightness 10, glyph 26, background 6) with
+  the skip button faintly on top. `findSkipButton` demanded an absolute white glyph and a 15-level contrast, and sized the disc as a
+  fraction of the screen (wrong on the tablet: the disc radius is ~32 px, a physical size). Now: ratio-based tests (lo >= 6, flat
+  within 12%, 1.25x apart from its surroundings, glyph >= 1.8x the disc) and two disc sizes. Sample:
+  `samples/ad-ironsource-dimmed-skip-tablet.png`. Again: physical sizes do not scale with the screen.
+- **`mrail_close_wrapper`** (ironSource's MRAID container) is in the UI tree from the first second of an ad, invisible, and does nothing:
+  **91 taps and 23 BACK presses** in one day. Each series ended with "did nothing 3 times: BACK" **in the middle of a video**, which can
+  cost the reward (not measured). Fixes: it is never a target; a close button known only by resource id needs the ad to be 10 s old
+  (`CLOSE_NODE_AFTER_MS`); BACK after fruitless taps now needs the ad to be 60 s old (`BACK_AFTER_FRUITLESS_MS`). The real ironSource close
+  is `closeButton`. If ironSource ads start timing out, suspect these gates first.
+
+## "Ask Claude" fallback (`android/ai.js`): the bot calls the `claude` command with Haiku for screens its rules cannot read
+
+Decided with the owner (2026-10-22) after one new close-button gap per ad network kept appearing: keep the fast rules and ask a
+cheap vision model only when an ad has overstayed. **No API key**: it runs `claude -p ... --model haiku` (needs a logged-in CLI:
+`claude auth login`; the login on this PC had expired once and the call failed with "OAuth session expired").
+
+- **When**: an ad that has been up 60 s (`--ai-after`) with no target from any rule, at most 3 questions per ad, 25 s apart, 150 a
+  day (`--ai-daily-max`), `--no-ai` turns it off; two failures in a row (e.g. expired login) switch it off for the run. Also once when
+  the bot is stuck on a screen after a restart (4 wake clicks): "is there a one-button message?".
+- **What is sent**: the two top corners at FULL resolution side by side (640x400 each, magenta divider), brightened if dark. A
+  half-size whole screen made tiny buttons unreadable and Haiku said "none". The image goes inline as a base64 block (stream-json
+  input, no tools). The model must DESCRIBE each corner before deciding (schema field order): 20/20 correct vs about 8/10 without.
+- **Measured** on saved stuck frames: Marines X, dim ironSource skip, hairline X, top-left video X, tiny "»": all within 0-5 px; the
+  Total Battle playable (a DOWNLOAD button, no close control) correctly "none". About 10 s and 1.4-2.0 cents (API-equivalent) per call.
+  The model is not fully consistent run to run, hence the retries and the describe-first schema.
+- **Safety, all enforced by the bot, not the model**: the label must match close/skip/X/dismiss and must not match install, download,
+  learn more, buy, get, open, play, mute, info, privacy, price; the pixel must not be purchase-green; a spot that already did nothing
+  is not tapped again; the tap is dropped if the ad ended during the ~10 s wait. Dialogs: only OK / Close / Continue / Got it /
+  Dismiss / Retry. Two-button questions (the cloud-save prompt) are never answered.
+- **Not covered**: flashing controls (a 1 s pill; the on-device scripts handle those), and whether skipping early costs the reward.
+- Spend guard in `android/ai-usage.json` (git-ignored). Tests use a fake `claude` (`ai.setRunner`); nothing in `node test.js` calls it.
+- Learning from successes (remember where a network's close button was) is NOT built; the log records every call and outcome.
 
 ## Ideas not done
 

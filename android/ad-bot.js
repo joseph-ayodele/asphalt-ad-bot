@@ -22,6 +22,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { readPng, writePng } = require('./png');
+const ai = require('./ai');
 
 const GAME = 'com.gameloft.android.ANMP.GloftA8HM';
 const TICK_MS = 1000;
@@ -30,6 +31,10 @@ const AD_OPEN_WAIT_MS = 15000;      // PLAY AD! tapped but no ad screen appeared
 const AD_TIMEOUT_MS = 240000;       // ads run up to ~150s; past this, press BACK
 const AMBIGUOUS_WAIT_MS = 8000;     // how long to wait for the menu to settle before taking a lower-priority ad
 const DEFAULT_RESTART_HOURS = 2;    // with --loop, restart the game this often (--restart-hours 0 turns it off)
+// "Ask Claude" fallback (ai.js): only for an ad that has overstayed with nothing the rules can tap; a few calls per ad, a daily cap.
+const AI_AFTER_MS = 60000, AI_EVERY_MS = 25000, AI_MAX_PER_AD = 3, AI_DAILY_MAX = 150, AI_MAX_FAILS = 2;
+const CLOSE_NODE_AFTER_MS = 10000;  // a close button known only by its resource id is not trusted in an ad's first seconds
+const RESTING_MS = 20000;        // a spot that did nothing 3 times is passed over this long, so other candidates get tried
 const CORNER_SKIP_AFTER_MS = 10000; // the tiny unlabelled top-right "»" (BidMachine) is tapped once an ad has been up this long
 const SKIP_BUTTON_AFTER_MS = 10000; // the other late skips (disc, "Skip" button): set to 10 s by the owner (was 75); they only appear once an ad is skippable
 const NO_FILL_BACKOFF_MS = 60000;
@@ -285,6 +290,53 @@ function findFreeTiles(img) {
 }
 const backArrow = (img) => ({ x: Math.round(img.w * 0.058), y: Math.round(img.h * 0.072) });
 
+// A dialog with exactly ONE white button in the middle of the screen (an "OK" on an info or maintenance message). The game's
+// two-button dialogs (the cloud-save prompt, "Replay race?") have two white buttons and are never matched, so the bot can never
+// answer a question that is the owner's to answer. White boxes are found as filled, roughly button-sized connected blobs with
+// dark text inside; thin white text and white ring spinners do not qualify.
+function findSingleOkButton(img) {
+  const step = 4, x0 = Math.round(img.w * 0.2), x1 = Math.round(img.w * 0.8), y0 = Math.round(img.h * 0.35), y1 = Math.round(img.h * 0.9);
+  const cols = Math.floor((x1 - x0) / step), rows = Math.floor((y1 - y0) / step);
+  const white = new Uint8Array(cols * rows);
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) white[r * cols + c] = isWhite(px(img, x0 + c * step, y0 + r * step)) ? 1 : 0;
+  const seen = new Uint8Array(cols * rows), boxes = [];
+  for (let s = 0; s < white.length; s++) {
+    if (!white[s] || seen[s]) continue;
+    const stack = [s]; seen[s] = 1;
+    let minC = cols, maxC = 0, minR = rows, maxR = 0, n = 0;
+    while (stack.length) {
+      const i = stack.pop(), c = i % cols, r = (i / cols) | 0;
+      n++; minC = Math.min(minC, c); maxC = Math.max(maxC, c); minR = Math.min(minR, r); maxR = Math.max(maxR, r);
+      for (const j of [i - 1, i + 1, i - cols, i + cols]) {
+        if (j < 0 || j >= white.length || seen[j] || !white[j]) continue;
+        if ((j === i - 1 && c === 0) || (j === i + 1 && c === cols - 1)) continue;
+        seen[j] = 1; stack.push(j);
+      }
+    }
+    const bw = (maxC - minC + 1) * step, bh = (maxR - minR + 1) * step;
+    if (bw < img.w * 0.10 || bh < img.h * 0.04 || bw > img.w * 0.5 || bh > img.h * 0.15) continue;   // button-sized only
+    if (n * step * step < bw * bh * 0.55) continue;                                                   // a filled box, not a ring or text
+    const bx = x0 + minC * step, by = y0 + minR * step;
+    let dark = 0;
+    for (let y = by + 2; y < by + bh - 2; y += 3) for (let x = bx + 2; x < bx + bw - 2; x += 3) if (minCh(px(img, x, y)) < 120) dark++;
+    if (dark < 12) continue;                                                                          // it has dark text on it
+    boxes.push({ cx: bx + (bw >> 1), cy: by + (bh >> 1), bw, bh });
+  }
+  return boxes.length === 1 ? boxes[0] : null;
+}
+
+function saveStuckFrame(img) {
+  try {
+    const dir = path.join(__dirname, 'stuck');
+    fs.mkdirSync(dir, { recursive: true });
+    const old = fs.readdirSync(dir).filter((f) => f.endsWith('.png')).sort();
+    for (const f of old.slice(0, Math.max(0, old.length - 15))) fs.unlinkSync(path.join(dir, f));   // keep the newest 15
+    const file = path.join(dir, `stuck-${new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19)}.png`);
+    fs.writeFileSync(file, writePng(img));
+    log(`stuck for a while on a screen the bot does not know: saved ${path.basename(file)} in stuck/ (send it to be looked at)`);
+  } catch (e) { log(`could not save the stuck frame: ${e.message}`); }
+}
+
 // The title screen after a (re)launch: "Press any key to continue" in white at the bottom centre, nothing else down there.
 function isTitleScreen(img) {
   let n = 0;
@@ -348,12 +400,20 @@ function findAdCornerX(img) {
 // the top-right corner once the video is over; it is not in the UI tree. Tapping it moves on to the end card, where the
 // same button becomes a ✕. A flat disc, brighter than what is behind it, with a bright glyph in the middle.
 function findSkipButton(img) {
-  const m = Math.min(img.w, img.h), r = Math.round(m * 0.032), s = Math.round(m * 0.16);
+  // The disc is a fixed physical size, not a fraction of the screen (radius ~23 px on the 720-high emulator, ~32 px on the
+  // 1600-high tablet), so two sizes are tried.
+  const m = Math.min(img.w, img.h), s = Math.round(m * 0.16);
+  for (const rf of [0.032, 0.02]) {
+    const found = findSkipDisc(img, Math.round(m * rf), s);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findSkipDisc(img, r, s) {
+  {
   for (let cy = r; cy < s; cy += 2) {
     for (let cx = img.w - s; cx < img.w - r; cx += 2) {
-      let glyph = 0;
-      for (let dy = -4; dy <= 4; dy += 2) for (let dx = -8; dx <= 8; dx += 2) if (minCh(px(img, cx + dx, cy + dy)) > 225) glyph++;
-      if (glyph < 6) continue;
       let lo = 255, hi = 0, outLo = 255, outHi = 0;
       for (let k = 0; k < 12; k++) {
         const a = (k * Math.PI) / 6, ca = Math.cos(a), sa = Math.sin(a);
@@ -362,9 +422,21 @@ function findSkipButton(img) {
         const o = minCh(px(img, Math.round(cx + 1.4 * r * ca), Math.round(cy + 1.4 * r * sa)));
         outLo = Math.min(outLo, o); outHi = Math.max(outHi, o);
       }
+      // Everything is judged by RATIOS, not absolute brightness: some ironSource ads dim the whole screen to near black while the
+      // skip button stays on top of the dimming (disc 10, glyph 26, background 6 on the tablet), and an absolute "white glyph, disc
+      // 15 levels apart" never matched that. lo >= 6 keeps compression noise on pure black from counting.
+      if (lo < 6) continue;
       // flat disc, either lighter or darker than what is behind it
-      if (hi - lo <= 10 && (lo - outHi >= 15 || outLo - hi >= 15)) return { x: cx, y: cy };
+      const flat = hi - lo <= Math.max(6, hi * 0.12);
+      const distinct = lo >= outHi * 1.25 + 2 || outLo >= hi * 1.25 + 2;
+      if (!flat || !distinct) continue;
+      // a glyph clearly brighter than the disc, in the middle of it
+      let glyph = 0;
+      const gmin = Math.max(lo * 1.8, lo + 12);
+      for (let dy = -4; dy <= 4; dy += 2) for (let dx = -8; dx <= 8; dx += 2) if (minCh(px(img, cx + dx, cy + dy)) >= gmin) glyph++;
+      if (glyph >= 6) return { x: cx, y: cy };
     }
+  }
   }
   return null;
 }
@@ -391,7 +463,10 @@ function parseNodes(xml) {
 const NEVER_TAP = /install|download|learn more|more info|open|get it|play now|shop|buy|visit|subscribe|sign up/i;
 
 // Where to tap to move an ad screen along. Ordered by confidence.
-function adDismissTarget(nodes, ageMs = 0) {
+// resting: a Set of "x,y" spots that were tapped 3 times without effect in this ad; they are passed over for a while so the next
+// candidate gets its turn (the same element can be dead during the video and live at the end, so nothing is banned for good).
+function adDismissTarget(nodes, ageMs = 0, resting = new Set()) {
+  const awake = (n) => !resting.has(`${n.cx},${n.cy}`);
   // Unity's "Open Store ⏭" pill (a button whose text is "Skip Open Store"). It shows up while the video is still playing
   // and the owner confirmed the reward is already paid by then, so skipping at once saves up to a minute per ad. It would
   // otherwise be blocked twice over (NEVER_TAP has "open"), so it needs its own rule; the tap goes on the ⏭ end of the pill.
@@ -399,11 +474,16 @@ function adDismissTarget(nodes, ageMs = 0) {
   if (unitySkip) return { why: 'Unity skip (reward already paid)', x: unitySkip.x2 - Math.round((unitySkip.y2 - unitySkip.y1) * 0.45), y: unitySkip.cy };
   // Networks label the same button differently: resource id (Fyber), content-desc (Meta, "Close Ad"), or visible text
   // (Unity playables, "Close").
+  // ironSource's `mrail_close_wrapper` / `mrail_close` exist from the first second, do nothing during the video, and close the ad at
+  // the end (last tap before 12 closes in the logs). So they are not banned; a close button known only by resource id waits out a
+  // short grace period, and anything that does nothing 3 times rests (see adStep) so the next candidate, e.g. the real
+  // `closeButton` listed after them, gets tried.
   const close = nodes.find((n) => (/close|dismiss/i.test(`${n.id} ${n.desc}`) || /^(close|dismiss)\b/i.test(n.text)) &&
+    !(n.id && !n.desc && !n.text && ageMs < CLOSE_NODE_AFTER_MS) && awake(n) &&
     !NEVER_TAP.test(n.text) && n.x2 > n.x1 && n.y2 > n.y1 && n.x2 - n.x1 < 400);
   if (close) return { why: `close button ${close.id || close.desc}`, x: close.cx, y: close.cy };
   // Store-promo end cards (Digital Turbine / Fyber) dismiss with a small unlabeled svg button in a corner.
-  const svg = nodes.find((n) => n.clickable && n.cls === 'Button' && /^svg\+xml/.test(n.text) && n.x2 - n.x1 <= 120 && n.y2 - n.y1 <= 120);
+  const svg = nodes.find((n) => awake(n) && n.clickable && n.cls === 'Button' && /^svg\+xml/.test(n.text) && n.x2 - n.x1 <= 120 && n.y2 - n.y1 <= 120);
   if (svg) return { why: 'store promo dismiss', x: svg.cx, y: svg.cy };
   // A plain "Skip" button (AdMob app-install end cards, content-description "Skip"). Skipping a rewarded video early can
   // forfeit the reward, so it is only used once the ad has been up long enough that any video is over.
@@ -412,12 +492,12 @@ function adDismissTarget(nodes, ageMs = 0) {
   // the same sort of corner image, so the same rule then finds that. The owner chose 10 s.
   if (ageMs >= CORNER_SKIP_AFTER_MS) {
     const maxX = Math.max(0, ...nodes.map((n) => n.x2));
-    const corner = nodes.find((n) => n.cls === 'ImageView' && n.clickable && !n.text && !n.desc && n.x2 - n.x1 <= 100 && n.y2 - n.y1 <= 100 &&
+    const corner = nodes.find((n) => awake(n) && n.cls === 'ImageView' && n.clickable && !n.text && !n.desc && n.x2 - n.x1 <= 100 && n.y2 - n.y1 <= 100 &&
       n.x1 > maxX * 0.85 && n.y1 < 200);
     if (corner) return { why: 'tiny corner button (skip / close)', x: corner.cx, y: corner.cy };
   }
   if (ageMs >= SKIP_BUTTON_AFTER_MS) {
-    const skip = nodes.find((n) => n.clickable && /^skip( ad)?$/i.test((n.desc || n.text).trim()) && n.x2 - n.x1 < 400 && n.y2 > n.y1);
+    const skip = nodes.find((n) => awake(n) && n.clickable && /^skip( ad)?$/i.test((n.desc || n.text).trim()) && n.x2 - n.x1 < 400 && n.y2 > n.y1);
     if (skip) return { why: 'skip button', x: skip.cx, y: skip.cy };
   }
   return null;
@@ -433,6 +513,9 @@ const args = (() => {
     else if (v[i] === '--loop') a.loop = /^\d+(\.\d+)?$/.test(v[i + 1] || '') ? Number(v[++i]) : 30;
     else if (v[i] === '--devices') a.devices = true;
     else if (v[i] === '--stop') a.stop = true;
+    else if (v[i] === '--no-ai') a.noAi = true;                       // never ask Claude about a stuck screen
+    else if (v[i] === '--ai-after') a.aiAfter = Number(v[++i]);        // seconds an ad must overstay before Claude is asked (default 60)
+    else if (v[i] === '--ai-daily-max') a.aiDailyMax = Number(v[++i]); // calls per day (default 150)
     else if (v[i] === '--order') a.order = v[++i];                    // e.g. relay,rewards,wrench,coin
     else if (v[i] === '--restart-hours') a.restartHours = Number(v[++i]);   // restart the game this often (0 = never)
     else if (v[i] === '--restart-emulator') a.restartEmulator = true;
@@ -460,7 +543,7 @@ const st = {
   popupWindowUntil: 0, popupBacks: 0, popupSeen: 0, lastBack: 0, returnedAt: 0, lastTitleTap: 0,
   ads: 0, inAd: false, awaitingAd: false, kind: 'coin', adStart: 0, lastPlay: 0, lastAction: Date.now(), lastPopupScan: 0, backs: 0,
   noFillUntil: { coin: 0, wrench: 0, rewards: 0, relay: 0 }, lastTarget: '', sameTarget: 0, foreign: 0,
-  tileDoneUntil: [], tileIdx: 0, lastRelayNav: 0, lastHomeTap: 0, titleSeen: 0, lastWake: 0,
+  tileDoneUntil: [], tileIdx: 0, lastRelayNav: 0, lastHomeTap: 0, titleSeen: 0, lastWake: 0, wakeStreak: 0, lastOkTap: 0, aiRuns: 0, lastAi: 0, aiFails: 0, aiDisabled: false, aiCalls: 0,
   appStartedAt: Date.now(), errors: 0, avdName: '', ambiguousSince: 0,
 };
 
@@ -645,10 +728,34 @@ function gameStep() {
     }
   }
 
+  // Stuck after a game restart (about 2 minutes of "wake clicks" each time, seen live): the game is waiting on something the bot
+  // does not recognise, e.g. a "server maintenance" dialog with a single OK button. Two things: save the frame so it can be
+  // looked at (stuck/ folder, git-ignored), and, after a couple of wake clicks, press the one button of a single-button dialog.
+  if (shopButtonVisible(img)) st.wakeStreak = 0;
+  if (st.wakeStreak >= 2 && now - st.lastOkTap > 8000) {
+    const ok = findSingleOkButton(img);
+    if (ok) { st.lastOkTap = now; safeTap(img, ok.cx, ok.cy, 'dialog with a single OK button (stuck screen)'); sleep(2500); return; }
+  }
+  if (st.wakeStreak === 4) {
+    saveStuckFrame(img); st.wakeStreak++;
+    // stuck on a screen after a restart: ask Claude whether it is a one-button message (maintenance notice...) and press it
+    if (!args.noAi && !st.aiDisabled && ai.readUsage().calls < (args.aiDailyMax > 0 ? args.aiDailyMax : AI_DAILY_MAX)) {
+      try {
+        const a = ai.askDialog(img); st.aiFails = 0;
+        const used = ai.recordUsage(a.costUsd); st.aiCalls++;
+        if (a.none) log(`Claude (stuck screen, today ${used.calls} calls): no one-button message found`);
+        else if (!ai.labelAllowed(a.label, 'dialog')) log(`Claude (stuck screen): refused to tap "${a.label}" at ${a.x},${a.y} (only OK / Close / Continue / Got it / Dismiss / Retry are allowed)`);
+        else if (isBuyGreen(px(img, a.x, a.y))) log(`Claude (stuck screen): refused ${a.x},${a.y}: green pixel`);
+        else { safeTap(img, a.x, a.y, `Claude (stuck screen): "${a.label}"`); sleep(2500); return; }
+      } catch (e) { aiFailed(e); }
+    }
+  }
+
   // The menus hide their buttons after a few idle seconds; a tap on empty floor brings them back. It does not count as
   // activity, so a button that never returns (no ads left) still ends in the idle stop.
   if (!shopButtonVisible(img) && !popupPanelVisible(img) && now - st.lastAction > WAKE_AFTER_QUIET_MS && now - st.lastWake > WAKE_EVERY_MS) {
     st.lastWake = now;
+    st.wakeStreak = (st.wakeStreak || 0) + 1;
     // An empty spot at the top, between the profile and the currency bar. (The old spot, on the floor to the right of the
     // car, is where the driver stands on the tablet's layout, and tapping the driver toggles a close-up that hides the menu.)
     const x = Math.round(img.w * 0.40), y = Math.round(img.h * 0.04);
@@ -714,10 +821,48 @@ function unityFastSkip(f, now) {
   return false;
 }
 
+// ---- Claude as the fallback for screens the rules cannot read ------------------------------------------------------------------
+let focusProbe = () => focus();                 // tests replace this
+function aiDue(now, ageMs) {
+  if (args.noAi || st.aiDisabled) return false;
+  if (ageMs < (args.aiAfter > 0 ? args.aiAfter * 1000 : AI_AFTER_MS) || now - st.lastAi < AI_EVERY_MS || st.aiRuns >= AI_MAX_PER_AD) return false;
+  return ai.readUsage().calls < (args.aiDailyMax > 0 ? args.aiDailyMax : AI_DAILY_MAX);
+}
+
+function aiFailed(e) {
+  st.aiFails++;
+  log(`Claude fallback failed (${st.aiFails}/${AI_MAX_FAILS}): ${e.message}`);
+  if (st.aiFails >= AI_MAX_FAILS) { st.aiDisabled = true; log('Claude fallback switched off for this run (fix the cause above, then restart the bot)'); }
+}
+
+// Ask about the top corners of the current ad. Every answer is checked before it is tapped: the label must be a close/skip kind
+// (not install/download/buy/open/mute/info...), the pixel must not be a green purchase colour, a spot already tried must not be
+// tried again, and the ad must still be the same one when the (10 s) answer arrives.
+function aiAssist(f, img, now, resting) {
+  st.lastAi = now; st.aiRuns++;
+  let a;
+  try { a = ai.askCorners(img); st.aiFails = 0; } catch (e) { aiFailed(e); return false; }
+  const used = ai.recordUsage(a.costUsd); st.aiCalls++;
+  const tag = `Claude (call ${st.aiRuns}/${AI_MAX_PER_AD} for this ad, ${a.seconds.toFixed(0)} s, today ${used.calls} calls ~${used.costUsd.toFixed(2)})`;
+  if (a.none) { log(`${tag}: no close or skip control found${a.outside ? ' (answer was outside the corners)' : ''}`); return false; }
+  if (!ai.labelAllowed(a.label)) { log(`${tag}: refused to tap "${a.label}" at ${a.x},${a.y} (not a close or skip control)`); return false; }
+  if (resting.has(`${a.x},${a.y}`)) { log(`${tag}: suggested ${a.x},${a.y} again, which already did nothing; skipping it`); return false; }
+  if (isBuyGreen(px(img, a.x, a.y))) { log(`${tag}: refused ${a.x},${a.y}: green (purchase) pixel`); return false; }
+  const nowFocus = focusProbe();
+  if (!nowFocus || nowFocus.act !== f.act) { log(`${tag}: the ad ended while waiting; nothing tapped`); return true; }
+  log(`${tag}: tapping "${a.label}" at ${a.x},${a.y}`);
+  tap(a.x, a.y);
+  st.lastAction = Date.now();
+  if (!st.resting) st.resting = new Map();
+  st.resting.set(`${a.x},${a.y}`, Date.now() + RESTING_MS);   // if it did nothing, do not be told the same spot again at once
+  sleep(2500);
+  return true;
+}
+
 function adStep(f) {
   const now = Date.now();
   st.lastAction = now;   // time spent in an ad is activity, not idleness
-  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; st.reveals = 0; st.lastReveal = 0; st.unitySkipped = false; st.watchRuns = 0; }
+  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; st.reveals = 0; st.lastReveal = 0; st.unitySkipped = false; st.watchRuns = 0; st.resting = new Map(); st.aiRuns = 0; st.lastAi = 0; }
   log(`ad screen ${f.act.split('.').pop()} (${Math.round((now - st.adStart) / 1000)}s)`);
 
   if (now - st.adStart > AD_TIMEOUT_MS) {
@@ -728,27 +873,39 @@ function adStep(f) {
 
   if (unityFastSkip(f, now)) return;
 
+  // Spots that did nothing 3 times rest for a while (per ad), so every other candidate, from the tree AND from the screen, gets a
+  // turn. This replaced "did nothing 3 times: BACK", which pressed BACK 57 times on ironSource ads in a day, in the middle of
+  // videos (it can cost the reward). The only BACK left is the 4-minute timeout above.
+  for (const [k, until] of st.resting || []) if (until <= now) st.resting.delete(k);
+  const resting = new Set((st.resting || new Map()).keys());
   const nodes = uiNodes();
-  let target = adDismissTarget(nodes, now - st.adStart);
+  let target = adDismissTarget(nodes, now - st.adStart, resting);
   let img = null;
   if (!target && now - st.adStart > 8000) {
     img = screencap();
     const c = findAdCornerX(img);
-    if (c) target = { why: 'X in ad corner', x: c.x, y: c.y };
+    if (c && !resting.has(`${c.x},${c.y}`)) target = { why: 'X in ad corner', x: c.x, y: c.y };
     // The round skip button also shows up in some ads while the video is still playing; wait long enough that a normal
     // ad is over, so tapping it cannot cost the reward.
     else if (now - st.adStart > SKIP_BUTTON_AFTER_MS) {
       const k = findSkipButton(img);
-      if (k) target = { why: 'skip button in ad corner', x: k.x, y: k.y };
+      if (k && !resting.has(`${k.x},${k.y}`)) target = { why: 'skip button in ad corner', x: k.x, y: k.y };
     }
   }
   if (!target && img && appLovinReveal(f, img, now - st.adStart, now)) return;
+  if (!target && img && aiDue(now, now - st.adStart) && aiAssist(f, img, now, resting)) return;
   if (!target) return;
 
   const key = `${target.why}@${target.x},${target.y}`;
   st.sameTarget = key === st.lastTarget ? st.sameTarget + 1 : 0;
   st.lastTarget = key;
-  if (st.sameTarget >= 3) { log(`${target.why} did nothing 3 times: BACK`); back(); st.sameTarget = 0; return; }
+  if (st.sameTarget >= 3) {
+    st.resting = st.resting || new Map();
+    st.resting.set(`${target.x},${target.y}`, now + RESTING_MS);
+    log(`${target.why} at ${target.x},${target.y} did nothing 3 times: resting it ${RESTING_MS / 1000} s, trying the other candidates`);
+    st.sameTarget = 0; st.lastTarget = '';
+    return;
+  }
   log(`${target.why} at ${target.x},${target.y}`);
   tap(target.x, target.y);
   st.lastAction = Date.now();
@@ -930,5 +1087,5 @@ function main() {
 if (require.main === module) main();
 // for test.js: set options, run the ad chooser, inspect what it did
 function configure({ order, mode } = {}) { args.order = order; args.mode = mode || 'all'; ORDER = sourceOrder(); }
-module.exports = { chooseAd, configure, restartDue, noteDismissTap, appLovinReveal, unityFastSkip, parseNodes, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
+module.exports = { setFocusProbe: (fn) => { focusProbe = fn || (() => focus()); }, aiDue, aiAssist, findSingleOkButton, chooseAd, configure, restartDue, noteDismissTap, appLovinReveal, unityFastSkip, parseNodes, args, st, dryCalls, logLines, findNext, findGaragePlayAds, findXShape, findPopupX, findAdCornerX, findSkipButton, shopButtonVisible, popupPanelVisible, isTitleScreen,
   isMainMenu, isRelayScreen, findRelayPlayAd, findFreeTiles, adDismissTarget, px, minCh };
