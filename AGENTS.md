@@ -350,3 +350,13 @@ cheap vision model only when an ad has overstayed. **No API key**: it runs `clau
 
 Detect dead playables sooner than the 4-minute timeout; OCR the currency counters to log earnings; per-device config file;
 a scheduler wrapper (Task Scheduler / launchd) around `--loop`; a way to answer the cloud-save prompt only on the owner's say-so.
+
+## AppLovin pill: look first, do not tap an end card (emulator, 2026-10-22)
+
+On the emulator an AppLovin end card ("Congrats! You're seeing a test ad." + green Install) ate 5 of 6 reveal tries: **a tap anywhere on that
+card is an ad click and opens the Play Store**, so `revealskip.sh` dumped the store, found no "Google Play" label and the bot BACKed out.
+The pill is shown by itself for a couple of seconds **right after returning from the store** (the one try that worked ran seconds after a
+BACK; a hand screenshot also caught it). Now `revealskip.sh` looks first and taps the reveal spot only if nothing is showing (X < 0 =
+look only), and `foreignStep` sets `st.revealSoon` when it backs out of `com.android.vending` during an ad, so `appLovinReveal` looks at
+once instead of waiting 15 s. `REVEAL_MAX` is 10. Unit-tested; not yet seen live. Also seen: after a game restart a promo popup with a faint
+X (1165,100 on the emulator) was not found by `findPopupX`; closed by hand, frame not saved.

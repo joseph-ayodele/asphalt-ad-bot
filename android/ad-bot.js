@@ -777,14 +777,18 @@ function gameStep() {
 // three times. So revealskip.sh runs ON the device: reveal tap, dump the tree while the pill is up, read where the
 // "Google Play" label really is, tap it. Only for AppLovin, a few tries; the reveal tap lands harmlessly if there is no pill.
 // The gate is 10 s like the other skips (owner's call; AppLovin's end cards were seen to have paid already).
-const REVEAL_AFTER_MS = 10000, REVEAL_EVERY_MS = 15000, REVEAL_MAX = 6;
+const REVEAL_AFTER_MS = 10000, REVEAL_EVERY_MS = 15000, REVEAL_MAX = 10;
 const REVEALSKIP_REMOTE = '/data/local/tmp/revealskip.sh';
 let revealskipPushed = false;
 function appLovinReveal(f, img, ageMs, now) {
-  if (!/applovin/i.test(f.act) || ageMs < REVEAL_AFTER_MS || now - (st.lastReveal || 0) < REVEAL_EVERY_MS || (st.reveals || 0) >= REVEAL_MAX) return false;
+  // Back from the Play Store the pill is showing by itself, for a couple of seconds: look at once, without tapping (a tap on this
+  // end card is an ad click and opens the store again, which is what ate five of six tries on the emulator).
+  const justBack = !!st.revealSoon;
+  if (!/applovin/i.test(f.act) || ageMs < REVEAL_AFTER_MS || (!justBack && now - (st.lastReveal || 0) < REVEAL_EVERY_MS) || (st.reveals || 0) >= REVEAL_MAX) return false;
+  st.revealSoon = false;
   st.reveals = (st.reveals || 0) + 1;
   st.lastReveal = now;
-  const x1 = Math.round(img.w * 0.13), y1 = Math.round(img.h * 0.5);       // somewhere neutral to reveal the pill
+  const x1 = justBack ? -1 : Math.round(img.w * 0.13), y1 = justBack ? -1 : Math.round(img.h * 0.5);   // somewhere neutral to reveal the pill
   if (!revealskipPushed) { adb(['push', path.join(__dirname, 'revealskip.sh'), REVEALSKIP_REMOTE]); revealskipPushed = true; }
   const out = adb(['shell', 'sh', REVEALSKIP_REMOTE, String(x1), String(y1)], { timeout: 30000 }).toString('utf8').trim();
   const m = out.match(/tapped (\d+) (\d+)/);
@@ -862,7 +866,7 @@ function aiAssist(f, img, now, resting) {
 function adStep(f) {
   const now = Date.now();
   st.lastAction = now;   // time spent in an ad is activity, not idleness
-  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; st.reveals = 0; st.lastReveal = 0; st.unitySkipped = false; st.watchRuns = 0; st.resting = new Map(); st.aiRuns = 0; st.lastAi = 0; }
+  if (!st.inAd) { st.inAd = true; st.awaitingAd = false; st.adStart = now; st.backs = 0; st.lastTarget = ''; st.sameTarget = 0; st.reveals = 0; st.lastReveal = 0; st.revealSoon = false; st.unitySkipped = false; st.watchRuns = 0; st.resting = new Map(); st.aiRuns = 0; st.lastAi = 0; }
   log(`ad screen ${f.act.split('.').pop()} (${Math.round((now - st.adStart) / 1000)}s)`);
 
   if (now - st.adStart > AD_TIMEOUT_MS) {
@@ -922,6 +926,7 @@ function foreignStep(f) {
     return;
   }
   log(`left the game (${f.pkg}): BACK`);
+  if (/vending/i.test(f.pkg) && st.inAd) st.revealSoon = true;   // the ad's skip pill is up for a moment after we return (appLovinReveal)
   if (st.foreign++ >= 3) { log('could not get back: relaunching the game'); launchGame(); st.foreign = 0; sleep(8000); return; }
   if (st.foreign > 3) st.foreign = 0;
   back();

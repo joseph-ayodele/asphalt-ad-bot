@@ -252,13 +252,21 @@ Object.assign(cases, {
     assert(!bot.appLovinReveal(f, img, 95000, t + 5000), 'wait before trying again');
     assert(bot.appLovinReveal(f, img, 111000, t + 16000));
   },
-  'applovin: gives up after 6 tries': () => {
+  'applovin: back from the Play Store it looks at once (no reveal tap, no 15 s wait), once per return': () => {
+    const img = frame('ad-applovin-max-test-ad.png'), t = Date.now();
+    bot.st.reveals = 0; bot.st.lastReveal = t; bot.st.revealSoon = true; bot.dryCalls.length = 0;
+    const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
+    assert(bot.appLovinReveal(f, img, 90000, t + 1000));
+    assert(bot.dryCalls.includes('shell sh /data/local/tmp/revealskip.sh -1 -1'), JSON.stringify(bot.dryCalls));
+    assert(!bot.appLovinReveal(f, img, 91000, t + 2000), 'the flag is spent');
+  },
+  'applovin: gives up after 10 tries': () => {
     const img = frame('ad-applovin-max-test-ad.png');
     bot.st.reveals = 0; bot.st.lastReveal = 0; bot.dryCalls.length = 0;
     const f = { act: 'com.applovin.adview.AppLovinFullscreenActivity' };
     let n = 0;
     for (let i = 0; i < 12; i++) if (bot.appLovinReveal(f, img, 90000, i * 21000 + 1)) n++;
-    assert.strictEqual(n, 6);
+    assert.strictEqual(n, 10);
   },
   'applovin on-device script: finds the REAL tablet pill (80,42-216,55), taps its centre (148,48); with no pill it ends in "none"': () => {
     if (!haveSh) throw { skip: 'no sh on this machine' };
@@ -268,8 +276,8 @@ Object.assign(cases, {
       const w = `uiautomator(){ cp "${tree}" "$SW_DIR/rs.xml"; }; input(){ echo "INPUT $*"; }; . "${path.join(__dirname, 'revealskip.sh').replace(/\\/g, '/')}" 333 800`;
       return spawnSync('sh', ['-c', w], { env: { ...process.env, SW_DIR: dir.replace(/\\/g, '/') }, encoding: 'utf8' }).stdout.trim();
     };
-    assert.strictEqual(run(pill), 'INPUT tap 333 800\nINPUT tap 148 48\ntapped 148 48');
-    assert.strictEqual(run(noPillTree).split('\n').pop(), 'none');
+    assert.strictEqual(run(pill), 'INPUT tap 148 48\ntapped 148 48', 'a pill that is already up is tapped without a reveal tap first');
+    assert.strictEqual(run(noPillTree), 'INPUT tap 333 800\nINPUT tap 333 800\nnone', 'look first, then reveal-tap');
   },
   'applovin: the tablet\'s privacy end card has a hairline X (9 px arms) top right; it used to be invisible and the bot sat on it': () => {
     assert(near(bot.findAdCornerX(frame('ad-applovin-privacy-card-tablet-x.png')), [2494, 56], 8));
