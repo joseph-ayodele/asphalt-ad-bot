@@ -104,9 +104,9 @@ for (const [name, [nodes, want, age]] of Object.entries(treeCases)) cases[`tree:
 // is visible. `run` feeds a real screenshot to the chooser and reports what it did.
 const frame = (name) => readPng(fs.readFileSync(path.join(__dirname, 'samples', name)));
 const FUTURE = Date.now() + 3600000;
-function run(name, { order, mode, done = [], noFill = {}, tileIdx = 0 } = {}) {
+function run(name, { order, mode, done = [], noFill = {}, tileIdx = 0, settled = true } = {}) {
   bot.configure({ order, mode });
-  Object.assign(bot.st, { lastAction: 0, lastPlay: 0, lastHomeTap: 0, lastRelayNav: 0, awaitingAd: false, ads: 0, tileIdx,
+  Object.assign(bot.st, { lastAction: 0, lastPlay: 0, lastHomeTap: 0, lastRelayNav: 0, awaitingAd: false, ads: 0, tileIdx, notMenuSince: settled ? Date.now() - 10000 : 0,
     tileDoneUntil: done.map((d) => (d ? FUTURE : 0)), noFillUntil: { coin: 0, wrench: 0, rewards: 0, relay: 0, ...noFill } });
   bot.dryCalls.length = 0; bot.logLines.length = 0;
   const acted = bot.chooseAd(frame(name), Date.now());
@@ -141,6 +141,11 @@ Object.assign(cases, {
   'order: in the garage with a tile due -> go home first, not PLAY AD!': () => {
     const r = run('garage-play-ad-buttons.png');
     assert(/going to the main menu for relay/.test(r.log) && !/PLAY AD/.test(r.log), r.log);
+  },
+  'order: a screen that only just stopped looking like the main menu is not tapped at the home spot (it is the settings gear there)': () => {
+    const r = run('garage-play-ad-buttons.png', { settled: false });
+    assert(!/going to the main menu/.test(r.log) && !r.taps.length, r.log);
+    assert(r.acted === false, 'nothing is done on the first look');
   },
   'order: in the garage with the tiles waiting -> wrench before coin': () => {
     const r = run('garage-play-ad-buttons.png', { done: [true, true] });

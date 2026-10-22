@@ -619,6 +619,7 @@ function chooseAd(img, now) {
     if (now > st.noFillUntil[p.kind]) consider(priority(p.kind), () => playAd(p.kind, p.x, p.y), true);
   }
   if (isMainMenu(img)) {
+    st.notMenuSince = 0;
     const tiles = findFreeTiles(img);
     TILE_SOURCES.forEach((src, idx) => {
       if (!tileDue(idx, now)) return;
@@ -633,6 +634,10 @@ function chooseAd(img, now) {
     });
   } else if (shopButtonVisible(img) && now - st.lastAction > 3000 && now - st.lastHomeTap > 30000) {
     // In the garage or another submenu: if a better source is due, the home icon leads to the main menu, where its tile is.
+    // On the main menu the same spot is the SETTINGS gear (which opened Settings, with a DELETE-account button, when a popup had just
+    // closed and the menu was still fading in), so only trust "not the main menu" once it has held for a few seconds.
+    if (!st.notMenuSince) st.notMenuSince = now;
+    if (now - st.notMenuSince < HOME_AFTER_NOT_MENU_MS) return false;
     TILE_SOURCES.forEach((src, idx) => {
       if (tileDue(idx, now)) consider(priority(src), () => {
         st.lastHomeTap = now;
@@ -777,6 +782,7 @@ function gameStep() {
 // three times. So revealskip.sh runs ON the device: reveal tap, dump the tree while the pill is up, read where the
 // "Google Play" label really is, tap it. Only for AppLovin, a few tries; the reveal tap lands harmlessly if there is no pill.
 // The gate is 10 s like the other skips (owner's call; AppLovin's end cards were seen to have paid already).
+const HOME_AFTER_NOT_MENU_MS = 8000;
 const REVEAL_AFTER_MS = 10000, REVEAL_EVERY_MS = 15000, REVEAL_MAX = 10;
 const REVEALSKIP_REMOTE = '/data/local/tmp/revealskip.sh';
 let revealskipPushed = false;
