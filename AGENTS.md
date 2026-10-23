@@ -360,3 +360,23 @@ BACK; a hand screenshot also caught it). Now `revealskip.sh` looks first and tap
 look only), and `foreignStep` sets `st.revealSoon` when it backs out of `com.android.vending` during an ad, so `appLovinReveal` looks at
 once instead of waiting 15 s. `REVEAL_MAX` is 10. Unit-tested; not yet seen live. Also seen: after a game restart a promo popup with a faint
 X (1165,100 on the emulator) was not found by `findPopupX`; closed by hand, frame not saved.
+
+## Tiles are named by their icon, not their position; ad-load wait 30 s (tablet, 2026-10-23; unit-tested, not yet seen live)
+
+The main-menu tile row **shifts left** when a tile has no ad ready (its FREE tag goes). On the tablet only AD RELAY OFFERS was FREE, it
+sat where AD REWARDS normally is, and `findFreeTiles` + `TILE_SOURCES` (by index) logged and treated it as "rewards": the real
+rewards/relay state was tracked under the wrong name, so relay got marked "come back later" and the bot fell through to wrench. Now
+`tileKind` classifies each FREE tag by its icon (rewards = bright light-blue gem art, relay = navy film strip with white arrows) and
+`findFreeTiles` returns `{x, y, kind}` for rewards/relay only; the megaphone tile (audio ads) and a dimmed menu give `null` and are
+dropped, so the bot can never tap the megaphone. Thresholds were measured on 3 saved frames (tablet, emulator); if a tile is ever
+misnamed, measure `tileKind`'s fractions on that frame. `AD_OPEN_WAIT_MS` is 30 s (was 15 s): the tablet's ads take longer to appear, and
+15 s logged "no ad opened" (and a 60 s back-off) for ads that were still loading.
+
+## Relay/rewards screen: do not give up for 14 s (tablet, 2026-10-23; unit-tested, not yet seen live)
+
+After each ad the tablet takes several seconds to draw the PLAY AD! button on AD RELAY OFFERS / AD REWARDS again. The old rule (no
+button 4 s after the last action = "COME BACK LATER") left too early, marked the source done for 15 minutes and played wrench/coin,
+so the owner had to put the bot back on relay by hand. Now `RELAY_NO_PLAY_MS` (14 s) of continuous "no button" must pass first
+(`st.relayNoPlaySince`). If relay still gets abandoned, check the log for "has no ad ready" and what the frame really showed.
+Also seen: many `FullScreenWebViewDisplay` ads (Meta, ~15 s video with "Learn More") close themselves after 6-11 s with no tap from
+the bot; that is normal, not a failure.

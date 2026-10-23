@@ -27,7 +27,7 @@ const ai = require('./ai');
 const GAME = 'com.gameloft.android.ANMP.GloftA8HM';
 const TICK_MS = 1000;
 const PLAY_COOLDOWN_MS = 8000;      // the garage stays visible a moment after PLAY AD!
-const AD_OPEN_WAIT_MS = 15000;      // PLAY AD! tapped but no ad screen appeared: no ad filled
+const AD_OPEN_WAIT_MS = 30000;      // PLAY AD! tapped but no ad screen appeared: no ad filled (the tablet loads ads slowly, 15 s was too short)
 const AD_TIMEOUT_MS = 240000;       // ads run up to ~150s; past this, press BACK
 const AMBIGUOUS_WAIT_MS = 8000;     // how long to wait for the menu to settle before taking a lower-priority ad
 const DEFAULT_RESTART_HOURS = 2;    // with --loop, restart the game this often (--restart-hours 0 turns it off)
@@ -43,6 +43,7 @@ const POPUP_SCAN_EVERY_MS = 2000;
 const QUIET_BEFORE_POPUP_SCAN_MS = 2500;
 const POPUP_WINDOW_MS = 90000;      // promo popups show up in this stretch after an ad closes
 const MAX_POPUP_BACKS = 4;
+const RELAY_NO_PLAY_MS = 14000;   // on AD REWARDS / RELAY with no PLAY AD! showing: wait this long (the tablet draws it late) before "COME BACK LATER"
 const RELAY_RECHECK_MS = 15 * 60000; // after "COME BACK LATER", look again this much later
 const WAKE_AFTER_QUIET_MS = 5000;
 const WAKE_EVERY_MS = 8000;
@@ -265,10 +266,27 @@ function findRelayPlayAd(img) {
   return b && b.x <= Math.round(w * 0.80) && b.y <= Math.round(h * 0.93) ? b : null;
 }
 
-// The main menu's top-left column has tiles for the ad screens, each topped by a small green FREE tag: the first opens
-// AD REWARDS, the second AD RELAY OFFERS. Their positions differ per device (the tablet has an extra tile), so they
-// are found by their tags. The tag itself is green (a purchase colour for safeTap), so the tap goes just below it, on the
-// icon.
+// The main menu's top-left column has tiles for the ad screens, each topped by a small green FREE tag: AD REWARDS (a bright
+// blue gem icon) and AD RELAY OFFERS (a film strip with white arrows), then a third megaphone tile (the "audio ad relay", never
+// automated). A tile with no ad ready loses its tag and the row SHIFTS LEFT, so position says nothing: on the tablet the lone
+// FREE tile was AD RELAY OFFERS but sat where AD REWARDS usually is, and was logged as rewards. Each tile is therefore named by
+// its icon: `kind` is 'rewards' or 'relay', and anything else (the megaphone, a dimmed menu) is left out. The tag itself is green
+// (a purchase colour for safeTap), so the tap goes just below it, on the icon.
+function tileKind(img, x, y) {
+  const s = Math.round(img.w * 0.035);
+  let n = 0, lightBlue = 0, navy = 0, white = 0;
+  for (let yy = y - s; yy < y + s; yy++)
+    for (let xx = Math.round(x - s * 1.5); xx < x + s * 1.5; xx++) {
+      const c = px(img, xx, yy);
+      n++;
+      if (c[2] > 200 && c[0] < 110 && c[1] > 120) lightBlue++;
+      else if (c[2] > 150 && c[0] < 60 && c[1] < 120) navy++;
+      else if (c[0] > 230 && c[1] > 230 && c[2] > 230) white++;
+    }
+  if (lightBlue / n >= 0.04) return 'rewards';           // measured: rewards 0.048-0.073, relay 0.024-0.027, megaphone 0.026
+  if ((navy + white) / n >= 0.045) return 'relay';       // relay 0.052-0.077, megaphone 0.036
+  return null;
+}
 function findFreeTiles(img) {
   const pts = [];
   for (let y = Math.round(img.h * 0.10); y < Math.round(img.h * 0.32); y++)
@@ -285,8 +303,9 @@ function findFreeTiles(img) {
   }
   return tags.filter((t) => t.n > 60).map((t) => {
     const w = t.maxX - t.minX;
-    return { x: Math.round((t.minX + t.maxX) / 2), y: Math.round((t.minY + t.maxY) / 2 + w * 0.6) };
-  });
+    const x = Math.round((t.minX + t.maxX) / 2), y = Math.round((t.minY + t.maxY) / 2 + w * 0.6);
+    return { x, y, kind: tileKind(img, x, y) };
+  }).filter((t) => t.kind);
 }
 const backArrow = (img) => ({ x: Math.round(img.w * 0.058), y: Math.round(img.h * 0.072) });
 
@@ -543,7 +562,7 @@ const st = {
   popupWindowUntil: 0, popupBacks: 0, popupSeen: 0, lastBack: 0, returnedAt: 0, lastTitleTap: 0,
   ads: 0, inAd: false, awaitingAd: false, kind: 'coin', adStart: 0, lastPlay: 0, lastAction: Date.now(), lastPopupScan: 0, backs: 0,
   noFillUntil: { coin: 0, wrench: 0, rewards: 0, relay: 0 }, lastTarget: '', sameTarget: 0, foreign: 0,
-  tileDoneUntil: [], tileIdx: 0, lastRelayNav: 0, lastHomeTap: 0, titleSeen: 0, lastWake: 0, wakeStreak: 0, lastOkTap: 0, aiRuns: 0, lastAi: 0, aiFails: 0, aiDisabled: false, aiCalls: 0,
+  tileDoneUntil: [], tileIdx: -1, relayNoPlaySince: 0, lastRelayNav: 0, lastHomeTap: 0, titleSeen: 0, lastWake: 0, wakeStreak: 0, lastOkTap: 0, aiRuns: 0, lastAi: 0, aiFails: 0, aiDisabled: false, aiCalls: 0,
   appStartedAt: Date.now(), errors: 0, avdName: '', ambiguousSince: 0,
 };
 
@@ -598,12 +617,19 @@ function playAd(src, x, y) {
 // is busy with, between ads.
 function chooseAd(img, now) {
   if (isRelayScreen(img)) {                               // on AD REWARDS / AD RELAY OFFERS
+    // Both screens look alike, so after a start with one already open (-1) assume the better-ranked source: it is only bookkeeping.
+    if (st.tileIdx < 0) st.tileIdx = Math.max(0, TILE_SOURCES.reduce((b, src, i) => (priority(src) >= 0 && (b < 0 || priority(src) < priority(TILE_SOURCES[b])) ? i : b), -1));
     const src = TILE_SOURCES[st.tileIdx];
     const play = findRelayPlayAd(img);
+    if (play) st.relayNoPlaySince = 0;
+    else if (!st.relayNoPlaySince) st.relayNoPlaySince = now;
     if (play && priority(src) >= 0 && now > st.noFillUntil[src]) { playAd(src, play.cx, play.cy); return true; }
-    if (now - st.lastAction > 4000) {
+    // After an ad the tablet takes several seconds to draw the PLAY AD! button again; leaving after 4 s took a still-loading
+    // screen for "COME BACK LATER", marked the source done for 15 minutes and sent the bot to the wrench button instead.
+    if (now - st.lastAction > 4000 && now - st.relayNoPlaySince > RELAY_NO_PLAY_MS) {
       log(`${src} has no ad ready (COME BACK LATER): leaving`);
       st.tileDoneUntil[st.tileIdx] = now + RELAY_RECHECK_MS;
+      st.relayNoPlaySince = 0;
       const b = backArrow(img);
       safeTap(img, b.x, b.y, 'back arrow');
       sleep(2500);
@@ -612,6 +638,7 @@ function chooseAd(img, now) {
     return false;
   }
 
+  st.relayNoPlaySince = 0;                                // not on a relay/rewards screen
   let best = null;                                        // { pri, run, button }
   const consider = (pri, run, button = false) => { if (pri >= 0 && (!best || pri < best.pri)) best = { pri, run, button }; };
 
@@ -623,12 +650,13 @@ function chooseAd(img, now) {
     const tiles = findFreeTiles(img);
     TILE_SOURCES.forEach((src, idx) => {
       if (!tileDue(idx, now)) return;
-      if (idx >= tiles.length) { st.tileDoneUntil[idx] = now + RELAY_RECHECK_MS; return; }   // no such tile (no ad ready)
+      const tile = tiles.find((t) => t.kind === src);
+      if (!tile) { st.tileDoneUntil[idx] = now + RELAY_RECHECK_MS; return; }   // no FREE tile for it (no ad ready)
       if (now - st.lastRelayNav < 20000) return;
       consider(priority(src), () => {
         st.lastRelayNav = now;
         st.tileIdx = idx;
-        safeTap(img, tiles[idx].x, tiles[idx].y, `opening ${src} (tile ${idx + 1} of ${tiles.length})`);
+        safeTap(img, tile.x, tile.y, `opening ${src} (tile ${tiles.indexOf(tile) + 1} of ${tiles.length})`);
         sleep(3000);
       });
     });

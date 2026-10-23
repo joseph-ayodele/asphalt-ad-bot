@@ -109,7 +109,7 @@ function run(name, { order, mode, done = [], noFill = {}, tileIdx = 0, settled =
   Object.assign(bot.st, { lastAction: 0, lastPlay: 0, lastHomeTap: 0, lastRelayNav: 0, awaitingAd: false, ads: 0, tileIdx, notMenuSince: settled ? Date.now() - 10000 : 0,
     tileDoneUntil: done.map((d) => (d ? FUTURE : 0)), noFillUntil: { coin: 0, wrench: 0, rewards: 0, relay: 0, ...noFill } });
   bot.dryCalls.length = 0; bot.logLines.length = 0;
-  const acted = bot.chooseAd(frame(name), Date.now());
+  const acted = bot.chooseAd(typeof name === 'string' ? frame(name) : name, Date.now());
   return { acted, log: bot.logLines.join(' | '), taps: bot.dryCalls.filter((c) => c.includes('input tap')) };
 }
 const tapAt = (r) => (r.taps[0] || '').replace('shell input tap ', '');
@@ -119,6 +119,27 @@ Object.assign(cases, {
     const r = run('tablet-main-menu.png');
     assert(r.acted && /opening relay \(tile 2 of 2\)/.test(r.log), r.log);
     assert(near({ x: 492, y: 352 }, tapAt(r).split(' ').map(Number), 12), tapAt(r));
+  },
+  // The row shifts left when a tile has no ad: the lone FREE tile used to be taken for AD REWARDS (logged "rewards", tablet, 2026-10-23).
+  'tiles: tablet menu, rewards tile spent -> the lone FREE tile is named by its icon: AD RELAY OFFERS': () => {
+    const one = frame('tablet-main-menu.png');
+    for (let y = 270; y < 460; y++) for (let x = 200; x < 400; x++) one.data.set([20, 20, 30, 255], (y * one.w + x) * 4);   // paint out the rewards tile
+    const tiles = bot.findFreeTiles(one);
+    assert(tiles.length === 1 && tiles[0].kind === 'relay' && near(tiles[0], [492, 352], 12), JSON.stringify(tiles));
+    const r = run(one);
+    assert(r.acted && /opening relay \(tile 1 of 1\)/.test(r.log), r.log);
+  },
+  'tiles: tablet menu, relay tile spent -> the lone FREE tile is AD REWARDS': () => {
+    const one = frame('tablet-main-menu.png');
+    for (let y = 270; y < 460; y++) for (let x = 400; x < 600; x++) one.data.set([20, 20, 30, 255], (y * one.w + x) * 4);   // paint out the relay tile
+    const tiles = bot.findFreeTiles(one);
+    assert(tiles.length === 1 && tiles[0].kind === 'rewards', JSON.stringify(tiles));
+  },
+  'tiles: the third FREE tile (megaphone, audio ads) is never a tile, even when it is all that is left': () => {
+    const one = frame('tablet-main-menu-coin-only.png');
+    assert(bot.findFreeTiles(one).length === 2);
+    for (let y = 270; y < 460; y++) for (let x = 200; x < 600; x++) one.data.set([20, 20, 30, 255], (y * one.w + x) * 4);
+    assert.deepStrictEqual(bot.findFreeTiles(one), []);
   },
   'order: AD RELAY OFFERS waiting for its timer -> AD REWARDS next, still ahead of the wrench': () => {
     const r = run('tablet-main-menu.png', { done: [false, true] });
@@ -180,7 +201,11 @@ Object.assign(cases, {
   },
   'order: on the relay screen with no ad ready -> back out and remember it': () => {
     const r = run('ad-relay-offers-come-back-later.png', { tileIdx: 1 });
-    assert(/relay has no ad ready/.test(r.log) && bot.st.tileDoneUntil[1] > Date.now(), r.log);
+    assert(!r.acted && !/no ad ready/.test(r.log), 'a screen whose PLAY AD! has not shown yet must not be given up on at once: ' + r.log);
+    bot.st.relayNoPlaySince = Date.now() - 15000;
+    bot.dryCalls.length = 0; bot.logLines.length = 0;
+    assert(bot.chooseAd(frame('ad-relay-offers-come-back-later.png'), Date.now()));
+    assert(/relay has no ad ready/.test(bot.logLines.join(' ')) && bot.st.tileDoneUntil[1] > Date.now(), bot.logLines.join(' '));
   },
   'order: --order relay opens the second tile on the emulator menu too': () => {
     const r = run('main-menu.png', { order: 'relay' });
